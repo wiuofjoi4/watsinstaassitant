@@ -271,7 +271,7 @@ export async function saveMenuPrefs(formData: FormData) {
       autoMenuInstagram: formData.get("autoMenuInstagram") === "on",
     })
     .where(eq(restaurants.id, restaurantId));
-  redirect(`/admin/restaurants/${restaurantId}?menu=prefs`);
+  revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 
 export async function addMenuImages(formData: FormData) {
@@ -280,26 +280,16 @@ export async function addMenuImages(formData: FormData) {
   const restaurant = await first(
     db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
   );
-  if (!restaurant) {
-    redirect(`/admin/restaurants?menu=error`);
-  }
+  if (!restaurant) return;
 
   const current = parseMenuImages(restaurant.menuImages);
   const files = formData.getAll("images") as File[];
   const added: MenuImageRaw[] = [];
-  let tooLarge = false;
-  let notImage = false;
   for (const file of files) {
     if (current.length + added.length >= MAX_MENU_IMAGES) break;
     const mime = file.type || "image/jpeg";
-    if (!mime.startsWith("image/")) {
-      notImage = true;
-      continue;
-    }
-    if (file.size <= 0 || file.size > MAX_IMAGE_BYTES) {
-      tooLarge = true;
-      continue;
-    }
+    if (!mime.startsWith("image/")) continue;
+    if (file.size <= 0 || file.size > MAX_IMAGE_BYTES) continue;
     const bytes = new Uint8Array(await file.arrayBuffer());
     added.push({
       id: newId(),
@@ -307,16 +297,13 @@ export async function addMenuImages(formData: FormData) {
       base64: Buffer.from(bytes).toString("base64"),
     });
   }
-  if (added.length === 0) {
-    const reason = tooLarge ? "size" : notImage ? "type" : "none";
-    redirect(`/admin/restaurants/${restaurantId}?menu=error&reason=${reason}`);
-  }
+  if (added.length === 0) return;
 
   await db
     .update(restaurants)
     .set({ menuImages: JSON.stringify([...current, ...added]) })
     .where(eq(restaurants.id, restaurantId));
-  redirect(`/admin/restaurants/${restaurantId}?menu=ok&added=${added.length}`);
+  revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 
 export async function removeMenuImage(formData: FormData) {

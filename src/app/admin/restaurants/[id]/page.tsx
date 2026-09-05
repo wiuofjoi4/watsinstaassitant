@@ -1,18 +1,16 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
-  addMenuImages,
   connectInstagram,
   disconnectInstagram,
   generateLink,
-  removeMenuImage,
   resolveError,
   saveAgentConfig,
-  saveMenuPrefs,
   setOrderStatus,
   toggleAgent,
 } from "@/app/admin/actions";
 import { Badge, Card, CardHeader, EmptyState, Field, Input, Select, Textarea, Toggle } from "@/components/ui";
+import MenuImagesPanel from "@/components/menu-images-panel";
 import {
   getRestaurantConversations,
   getRestaurantDetail,
@@ -41,7 +39,10 @@ export default async function RestaurantDetailPage(
     ? `${appUrl}/link/${restaurant.linkToken}`
     : null;
 
-  const menuImages = parseMenuImages(restaurant.menuImages);
+  const menuImages = parseMenuImages(restaurant.menuImages).map((img, index) => ({
+    id: img.id,
+    index,
+  }));
 
   return (
     <div className="mx-auto max-w-6xl space-y-6">
@@ -50,7 +51,6 @@ export default async function RestaurantDetailPage(
           ← Restaurants
         </Link>
         <h1 className="mt-2 text-2xl font-semibold tracking-tight text-soft">{restaurant.name}</h1>
-        {search.menu ? <MenuActionBanner status={String(search.menu)} reason={search.reason ? String(search.reason) : undefined} added={search.added ? String(search.added) : undefined} /> : null}
       </div>
 
       {/* Status + actions bar */}
@@ -194,80 +194,13 @@ export default async function RestaurantDetailPage(
       </Card>
 
       {/* Menu images + auto-send */}
-      <Card className="p-5">
-        <div className="mb-4 flex items-center justify-between">
-          <div>
-            <p className="text-sm font-medium text-soft">Menu images & auto-send</p>
-            <p className="mt-0.5 text-xs text-muted">
-              Upload the menu pictures. When enabled for a channel, the agent will
-              send them to any customer message that is not a direct order.
-            </p>
-          </div>
-        </div>
-
-        <form action={saveMenuPrefs} className="mb-5 flex flex-wrap items-center gap-6 rounded-lg border border-line bg-surface/60 p-4">
-          <input type="hidden" name="restaurantId" value={restaurant.id} />
-          <label className="flex items-center gap-2.5 text-sm text-soft">
-            <Toggle key={`mw-${restaurant.autoMenuWhatsapp}`} checked={restaurant.autoMenuWhatsapp} name="autoMenuWhatsapp" />
-            Auto-send on WhatsApp
-          </label>
-          <label className="flex items-center gap-2.5 text-sm text-soft">
-            <Toggle key={`mi-${restaurant.autoMenuInstagram}`} checked={restaurant.autoMenuInstagram} name="autoMenuInstagram" />
-            Auto-send on Instagram
-          </label>
-          <button
-            type="submit"
-            className="ml-auto rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent"
-          >
-            Save preferences
-          </button>
-        </form>
-
-        <div className="space-y-4">
-          <form action={addMenuImages} className="flex flex-wrap items-end gap-3" encType="multipart/form-data">
-            <input type="hidden" name="restaurantId" value={restaurant.id} />
-            <input
-              type="file"
-              name="images"
-              multiple
-              accept="image/*"
-              className="block w-full max-w-sm text-xs text-muted file:mr-3 file:rounded-lg file:border-0 file:bg-primary/10 file:px-3 file:py-2 file:text-xs file:font-medium file:text-primary"
-            />
-            <button
-              type="submit"
-              className="rounded-lg border border-line px-3.5 py-2 text-sm font-medium text-soft transition-colors hover:bg-surface"
-            >
-              Add images
-            </button>
-          </form>
-
-          <div className="grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-6">
-            {menuImages.length === 0 ? (
-              <p className="col-span-full text-xs text-muted">No menu images uploaded yet.</p>
-            ) : (
-              menuImages.map((img, i) => (
-                <div key={img.id} className="group relative overflow-hidden rounded-lg border border-line">
-                  <img
-                    src={`${appUrl}/api/media/${restaurant.id}/${i}`}
-                    alt={`Menu ${i + 1}`}
-                    className="aspect-square w-full object-cover"
-                  />
-                  <form action={removeMenuImage} className="absolute right-1 top-1">
-                    <input type="hidden" name="restaurantId" value={restaurant.id} />
-                    <input type="hidden" name="index" value={i} />
-                    <button
-                      type="submit"
-                      title="Remove image"
-                      className="rounded-md bg-black/60 px-1.5 py-0.5 text-xs text-white opacity-0 transition-opacity hover:bg-bad group-hover:opacity-100"
-                    >
-                      ✕
-                    </button>
-                  </form>
-                </div>
-              ))
-            )}
-          </div>
-        </div>
+      <Card>
+        <MenuImagesPanel
+          restaurantId={restaurant.id}
+          images={menuImages}
+          autoWhatsapp={restaurant.autoMenuWhatsapp}
+          autoInstagram={restaurant.autoMenuInstagram}
+        />
       </Card>
 
       {/* Tabs */}
@@ -321,44 +254,6 @@ function parseMenuImages(raw: string | null | undefined): MenuImageRaw[] {
   } catch {
     return [];
   }
-}
-
-function MenuActionBanner({
-  status,
-  reason,
-  added,
-}: {
-  status: string;
-  reason?: string;
-  added?: string;
-}) {
-  let text = "";
-  let tone = "good";
-  if (status === "ok") {
-    text = `Added ${Number(added) || 1} menu image(s).`;
-  } else if (status === "prefs") {
-    text = "Menu auto-send preferences saved.";
-  } else if (reason === "size") {
-    text = "No images added: file is larger than 8 MB.";
-    tone = "bad";
-  } else if (reason === "type") {
-    text = "No images added: only image files are accepted.";
-    tone = "bad";
-  } else {
-    text = "No images were added. Check the file and try again.";
-    tone = "bad";
-  }
-  return (
-    <div
-      className={`mt-3 rounded-lg border px-3.5 py-2.5 text-xs ${
-        tone === "good"
-          ? "border-good/30 bg-good/10 text-good"
-          : "border-bad/30 bg-bad/10 text-bad"
-      }`}
-    >
-      {text}
-    </div>
-  );
 }
 
 function StatusChip({
