@@ -50,6 +50,7 @@ export default async function RestaurantDetailPage(
           ← Restaurants
         </Link>
         <h1 className="mt-2 text-2xl font-semibold tracking-tight text-soft">{restaurant.name}</h1>
+        {search.menu ? <MenuActionBanner status={String(search.menu)} reason={search.reason ? String(search.reason) : undefined} added={search.added ? String(search.added) : undefined} /> : null}
       </div>
 
       {/* Status + actions bar */}
@@ -320,6 +321,44 @@ function parseMenuImages(raw: string | null | undefined): MenuImageRaw[] {
   } catch {
     return [];
   }
+}
+
+function MenuActionBanner({
+  status,
+  reason,
+  added,
+}: {
+  status: string;
+  reason?: string;
+  added?: string;
+}) {
+  let text = "";
+  let tone = "good";
+  if (status === "ok") {
+    text = `Added ${Number(added) || 1} menu image(s).`;
+  } else if (status === "prefs") {
+    text = "Menu auto-send preferences saved.";
+  } else if (reason === "size") {
+    text = "No images added: file is larger than 8 MB.";
+    tone = "bad";
+  } else if (reason === "type") {
+    text = "No images added: only image files are accepted.";
+    tone = "bad";
+  } else {
+    text = "No images were added. Check the file and try again.";
+    tone = "bad";
+  }
+  return (
+    <div
+      className={`mt-3 rounded-lg border px-3.5 py-2.5 text-xs ${
+        tone === "good"
+          ? "border-good/30 bg-good/10 text-good"
+          : "border-bad/30 bg-bad/10 text-bad"
+      }`}
+    >
+      {text}
+    </div>
+  );
 }
 
 function StatusChip({

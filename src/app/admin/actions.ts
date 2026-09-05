@@ -259,7 +259,7 @@ function parseMenuImages(raw: string | null | undefined): MenuImageRaw[] {
 }
 
 const MAX_MENU_IMAGES = 8;
-const MAX_IMAGE_BYTES = 2.5 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 
 export async function saveMenuPrefs(formData: FormData) {
   await guard();
@@ -271,7 +271,7 @@ export async function saveMenuPrefs(formData: FormData) {
       autoMenuInstagram: formData.get("autoMenuInstagram") === "on",
     })
     .where(eq(restaurants.id, restaurantId));
-  revalidatePath(`/admin/restaurants/${restaurantId}`);
+  redirect(`/admin/restaurants/${restaurantId}?menu=prefs`);
 }
 
 export async function addMenuImages(formData: FormData) {
@@ -280,29 +280,43 @@ export async function addMenuImages(formData: FormData) {
   const restaurant = await first(
     db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
   );
-  if (!restaurant) return;
+  if (!restaurant) {
+    redirect(`/admin/restaurants?menu=error`);
+  }
 
   const current = parseMenuImages(restaurant.menuImages);
   const files = formData.getAll("images") as File[];
   const added: MenuImageRaw[] = [];
+  let tooLarge = false;
+  let notImage = false;
   for (const file of files) {
     if (current.length + added.length >= MAX_MENU_IMAGES) break;
-    if (!file.type.startsWith("image/")) continue;
-    if (file.size <= 0 || file.size > MAX_IMAGE_BYTES) continue;
+    const mime = file.type || "image/jpeg";
+    if (!mime.startsWith("image/")) {
+      notImage = true;
+      continue;
+    }
+    if (file.size <= 0 || file.size > MAX_IMAGE_BYTES) {
+      tooLarge = true;
+      continue;
+    }
     const bytes = new Uint8Array(await file.arrayBuffer());
     added.push({
       id: newId(),
-      mime: file.type,
+      mime,
       base64: Buffer.from(bytes).toString("base64"),
     });
   }
-  if (added.length === 0) return;
+  if (added.length === 0) {
+    const reason = tooLarge ? "size" : notImage ? "type" : "none";
+    redirect(`/admin/restaurants/${restaurantId}?menu=error&reason=${reason}`);
+  }
 
   await db
     .update(restaurants)
     .set({ menuImages: JSON.stringify([...current, ...added]) })
     .where(eq(restaurants.id, restaurantId));
-  revalidatePath(`/admin/restaurants/${restaurantId}`);
+  redirect(`/admin/restaurants/${restaurantId}?menu=ok&added=${added.length}`);
 }
 
 export async function removeMenuImage(formData: FormData) {
