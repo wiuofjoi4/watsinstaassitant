@@ -1,5 +1,6 @@
 import { notFound } from "next/navigation";
 import { getRestaurantByLinkToken } from "@/lib/queries";
+import WhatsAppQR from "@/components/whatsapp-qr";
 
 export default async function LinkPage(
   props: PageProps<"/link/[token]">
@@ -14,6 +15,7 @@ export default async function LinkPage(
   const qrUrl = gatewayBase
     ? `${gatewayBase}/qr/${restaurant.id}/whatsapp`
     : null;
+  const statusUrl = `/api/link-status?token=${encodeURIComponent(token)}`;
 
   const igAppConfigured = !!(process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET);
 
@@ -53,13 +55,10 @@ export default async function LinkPage(
 
           <div className="flex items-center justify-center rounded-lg border border-dashed border-line bg-surface py-6">
             {qrUrl ? (
-              // eslint-disable-next-line @next/next/no-img-element -- QR is a live stream from the gateway
-              <img
-                src={qrUrl}
-                alt="WhatsApp QR code"
-                className="h-56 w-56"
-                width={224}
-                height={224}
+              <WhatsAppQR
+                qrUrl={qrUrl}
+                statusUrl={statusUrl}
+                initiallyLinked={restaurant.whatsappLinked}
               />
             ) : (
               <div className="text-center">
