@@ -5,6 +5,8 @@ export default async function LinkPage(
   props: PageProps<"/link/[token]">
 ) {
   const { token } = await props.params;
+  const search = await props.searchParams;
+  const igState = String(search.ig ?? "");
   const restaurant = await getRestaurantByLinkToken(decodeURIComponent(token));
   if (!restaurant) notFound();
 
@@ -12,6 +14,8 @@ export default async function LinkPage(
   const qrUrl = gatewayBase
     ? `${gatewayBase}/qr/${restaurant.id}/whatsapp`
     : null;
+
+  const igAppConfigured = !!(process.env.INSTAGRAM_APP_ID && process.env.INSTAGRAM_APP_SECRET);
 
   return (
     <main className="flex flex-1 flex-col items-center justify-center bg-base px-6 py-16">
@@ -81,22 +85,55 @@ export default async function LinkPage(
               className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
                 restaurant.instagramLinked
                   ? "bg-good/15 text-good"
-                  : "bg-warn/15 text-warn"
+                  : igState === "error"
+                    ? "bg-bad/15 text-bad"
+                    : "bg-warn/15 text-warn"
               }`}
             >
               <span
                 className={`h-1.5 w-1.5 rounded-full ${
-                  restaurant.instagramLinked ? "bg-good" : "bg-warn"
+                  restaurant.instagramLinked
+                    ? "bg-good"
+                    : igState === "error"
+                      ? "bg-bad"
+                      : "bg-warn"
                 }`}
               />
-              {restaurant.instagramLinked ? "Connected" : "Set up by the team"}
+              {restaurant.instagramLinked ? "Connected" : "Connect now"}
             </span>
           </div>
-          <p className="text-xs text-muted">
-            Instagram has no phone-QR like WhatsApp. The team connects your
-            professional Instagram account through Meta&apos;s official API — just
-            share your account and the connection will be handled for you.
-          </p>
+
+          {igState === "connected" ? (
+            <div className="rounded-lg border border-good/25 bg-good/10 px-3.5 py-2.5 text-sm text-good">
+              Instagram connected successfully. Your agent is now available via DMs. ✓
+            </div>
+          ) : igState === "error" ? (
+            <div className="rounded-lg border border-bad/25 bg-bad/10 px-3.5 py-2.5 text-sm text-bad">
+              Connection failed. Please try again or contact the team.
+            </div>
+          ) : null}
+
+          {restaurant.instagramLinked ? (
+            <div className="space-y-2 text-xs text-muted">
+              <p>
+                Linked as {restaurant.instagramUsername ?? restaurant.instagramIgId ?? "your account"}. Your agent
+                replies to anyone who DMs your Instagram.
+              </p>
+            </div>
+          ) : igAppConfigured ? (
+            <a
+              href={`/api/instagram/oauth/start?token=${encodeURIComponent(token)}`}
+              className="mt-1 inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-amber-500 to-pink-600 px-4 py-2.5 text-sm font-semibold text-white transition-opacity hover:opacity-90"
+            >
+              Connect with Instagram
+            </a>
+          ) : (
+            <p className="text-xs text-muted">
+              Instagram connects through Meta&apos;s official API (no phone-QR like WhatsApp). The
+              connect button appears here once the team enables your Instagram app — share your
+              account and it will be handled for you.
+            </p>
+          )}
         </div>
 
         <p className="text-center text-[11px] text-muted/60">
