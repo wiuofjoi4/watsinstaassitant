@@ -32,7 +32,8 @@ export async function GET(req: Request) {
     );
   }
 
-  const scope = "instagram_business_basic,instagram_manage_messages";
+  const scope =
+    "instagram_business_basic,instagram_business_manage_comments,instagram_business_manage_messages";
   const authorize = new URL("https://api.instagram.com/oauth/authorize");
   authorize.searchParams.set("client_id", appId);
   authorize.searchParams.set("redirect_uri", callbackUrl);

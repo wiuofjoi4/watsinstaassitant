@@ -58,8 +58,8 @@ export async function GET(req: Request) {
     const long = await exchangeForLongLived(appSecret, short.access_token);
     const token = long.access_token ?? short.access_token;
 
-    const profile = await fetchIgProfile(String(short.user_id ?? ""), token);
-    const igId = String(short.user_id ?? profile?.id ?? "");
+    const profile = await fetchIgProfile(token);
+    const igId = profile?.id ?? String(short.user_id ?? "");
     const username = profile?.username ?? null;
 
     if (!igId) {
@@ -120,11 +120,9 @@ async function exchangeForLongLived(
 }
 
 async function fetchIgProfile(
-  igId: string,
   token: string
 ): Promise<{ id?: string; username?: string } | null> {
-  if (!igId) return null;
-  const url = new URL(`${GRAPH}/v22.0/${igId}`);
+  const url = new URL(`${GRAPH}/v22.0/me`);
   url.searchParams.set("fields", "id,username");
   url.searchParams.set("access_token", token);
   const res = await fetch(url.toString());
