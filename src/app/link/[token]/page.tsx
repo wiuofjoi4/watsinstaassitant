@@ -77,14 +77,25 @@ export default async function LinkPage(
         <div className="rounded-xl border border-line bg-card p-6">
           <div className="mb-3 flex items-center justify-between">
             <p className="text-sm font-medium text-soft">Instagram</p>
-            <span className="inline-flex items-center gap-1.5 rounded-full bg-warn/15 px-2.5 py-0.5 text-[11px] font-medium text-warn">
-              <span className="h-1.5 w-1.5 rounded-full bg-warn" />
-              Coming next
+            <span
+              className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${
+                restaurant.instagramLinked
+                  ? "bg-good/15 text-good"
+                  : "bg-warn/15 text-warn"
+              }`}
+            >
+              <span
+                className={`h-1.5 w-1.5 rounded-full ${
+                  restaurant.instagramLinked ? "bg-good" : "bg-warn"
+                }`}
+              />
+              {restaurant.instagramLinked ? "Connected" : "Set up by the team"}
             </span>
           </div>
           <p className="text-xs text-muted">
-            Instagram connection is on the roadmap and will be enabled here
-            after WhatsApp is live.
+            Instagram has no phone-QR like WhatsApp. The team connects your
+            professional Instagram account through Meta&apos;s official API — just
+            share your account and the connection will be handled for you.
           </p>
         </div>
 

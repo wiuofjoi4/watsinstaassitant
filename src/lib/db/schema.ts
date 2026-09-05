@@ -35,6 +35,8 @@ export const restaurants = repli.table(
       .notNull()
       .default(false),
     instagramStatus: text("instagram_status").notNull().default("disconnected"),
+    instagramToken: text("instagram_token"),
+    instagramIgId: text("instagram_ig_id"),
     linkToken: text("link_token"),
     totalSpendUsd: real("total_spend_usd").notNull().default(0),
   },

@@ -177,6 +177,43 @@ export async function generateLink(formData: FormData) {
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 
+export async function connectInstagram(formData: FormData) {
+  await guard();
+  const restaurantId = String(formData.get("restaurantId"));
+  const igId = String(formData.get("igId") ?? "").trim();
+  const username = String(formData.get("username") ?? "").trim();
+  const accessToken = String(formData.get("accessToken") ?? "").trim();
+  if (!igId || !accessToken) throw new Error("Instagram account ID and access token are required.");
+
+  await db
+    .update(restaurants)
+    .set({
+      instagramIgId: igId,
+      instagramUsername: username || null,
+      instagramToken: accessToken,
+      instagramLinked: true,
+      instagramStatus: "connected",
+    })
+    .where(eq(restaurants.id, restaurantId));
+  revalidatePath(`/admin/restaurants/${restaurantId}`);
+}
+
+export async function disconnectInstagram(formData: FormData) {
+  await guard();
+  const restaurantId = String(formData.get("restaurantId"));
+  await db
+    .update(restaurants)
+    .set({
+      instagramIgId: null,
+      instagramUsername: null,
+      instagramToken: null,
+      instagramLinked: false,
+      instagramStatus: "disconnected",
+    })
+    .where(eq(restaurants.id, restaurantId));
+  revalidatePath(`/admin/restaurants/${restaurantId}`);
+}
+
 export async function setOrderStatus(formData: FormData) {
   await guard();
   const orderId = String(formData.get("orderId"));

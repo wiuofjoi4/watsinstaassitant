@@ -1,6 +1,8 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
+  connectInstagram,
+  disconnectInstagram,
   generateLink,
   resolveError,
   saveAgentConfig,
@@ -109,6 +111,80 @@ export default async function RestaurantDetailPage(
             <p className="mt-0.5 break-all font-mono text-xs text-soft">{linkUrl}</p>
           </div>
         ) : null}
+      </Card>
+
+      {/* Instagram channel */}
+      <Card className="p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium text-soft">Instagram channel</p>
+            <p className="mt-0.5 text-xs text-muted">
+              Connect a Meta professional account — the agent replies to DMs via the official
+              Instagram API once you&apos;ve configured the Meta webhook.
+            </p>
+          </div>
+          <StatusChip
+            label="Status"
+            ok={restaurant.instagramStatus === "connected"}
+            okText={restaurant.instagramStatus}
+            badText={restaurant.instagramStatus ?? "disconnected"}
+            badTone={restaurant.instagramStatus === "waiting" ? "warn" : "neutral"}
+          />
+        </div>
+
+        {restaurant.instagramLinked && restaurant.instagramIgId ? (
+          <div className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-lg border border-line bg-surface/60 p-3">
+                <p className="text-[11px] uppercase tracking-wider text-muted">Account ID</p>
+                <p className="mt-0.5 break-all font-mono text-xs text-soft">{restaurant.instagramIgId}</p>
+              </div>
+              <div className="rounded-lg border border-line bg-surface/60 p-3">
+                <p className="text-[11px] uppercase tracking-wider text-muted">Username</p>
+                <p className="mt-0.5 text-xs text-soft">{restaurant.instagramUsername ?? "—"}</p>
+              </div>
+            </div>
+            <p className="text-xs text-muted">
+              Token stored (redacted). To receive DMs, point Meta&apos;s Webhooks app to{" "}
+              <code className="font-mono text-muted/80">
+                {appUrl}/api/webhooks/instagram
+              </code>{" "}
+              with verify token <code className="font-mono text-muted/80">INSTAGRAM_VERIFY_TOKEN</code>.
+            </p>
+            <form action={disconnectInstagram}>
+              <input type="hidden" name="restaurantId" value={restaurant.id} />
+              <button
+                type="submit"
+                className="rounded-lg border border-bad/30 bg-bad/15 px-3.5 py-2 text-sm font-medium text-bad transition-colors hover:bg-bad/25"
+              >
+                Disconnect Instagram
+              </button>
+            </form>
+          </div>
+        ) : (
+          <form action={connectInstagram} className="space-y-4">
+            <input type="hidden" name="restaurantId" value={restaurant.id} />
+            <div className="grid gap-4 md:grid-cols-3">
+              <Field label="Instagram account ID" hint="Numeric IG ID of the professional account.">
+                <Input name="igId" placeholder="17841400000000000" required />
+              </Field>
+              <Field label="Username" hint="e.g. your.restaurant (optional).">
+                <Input name="username" placeholder="your.restaurant" />
+              </Field>
+              <Field label="Access token" hint="Meta long-lived token with instagram_business_basic + instagram_manage_messages.">
+                <Input name="accessToken" type="password" placeholder="EAA..." required />
+              </Field>
+            </div>
+            <div className="flex justify-end">
+              <button
+                type="submit"
+                className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent"
+              >
+                Save Instagram connection
+              </button>
+            </div>
+          </form>
+        )}
       </Card>
 
       {/* Tabs */}

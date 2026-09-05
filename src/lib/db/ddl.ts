@@ -82,6 +82,8 @@ CREATE TABLE "repli"."restaurants" (
 	"instagram_username" text,
 	"instagram_linked" boolean DEFAULT false NOT NULL,
 	"instagram_status" text DEFAULT 'disconnected' NOT NULL,
+	"instagram_token" text,
+	"instagram_ig_id" text,
 	"link_token" text,
 	"total_spend_usd" real DEFAULT 0 NOT NULL
 );
@@ -134,6 +136,10 @@ CREATE INDEX "messages_conversation_idx" ON "repli"."messages" USING btree ("con
 CREATE INDEX "orders_restaurant_idx" ON "repli"."orders" USING btree ("restaurant_id","created_at");
 --> statement-breakpoint
 CREATE UNIQUE INDEX "restaurants_link_token_idx" ON "repli"."restaurants" USING btree ("link_token");
+--> statement-breakpoint
+ALTER TABLE "repli"."restaurants" ADD COLUMN IF NOT EXISTS "instagram_token" text;
+--> statement-breakpoint
+ALTER TABLE "repli"."restaurants" ADD COLUMN IF NOT EXISTS "instagram_ig_id" text;
 --> statement-breakpoint
 CREATE INDEX "usage_logs_restaurant_idx" ON "repli"."usage_logs" USING btree ("restaurant_id","created_at");
 `;
