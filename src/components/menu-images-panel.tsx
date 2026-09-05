@@ -1,7 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { startTransition, useRef, useState } from "react";
+import { startTransition, useEffect, useRef, useState } from "react";
 import {
   addMenuImages,
   removeMenuImage,
@@ -12,6 +12,11 @@ import { Toggle } from "@/components/ui";
 interface PanelImage {
   id: string;
   index: number;
+}
+
+interface LocalImage {
+  key: string;
+  url: string;
 }
 
 export default function MenuImagesPanel({
@@ -31,6 +36,23 @@ export default function MenuImagesPanel({
   const [wa, setWa] = useState(autoWhatsapp);
   const [ig, setIg] = useState(autoInstagram);
   const [msg, setMsg] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
+  const [local, setLocal] = useState<LocalImage[]>(() =>
+    images.map((im) => ({
+      key: `s-${im.id}`,
+      url: `/api/media/${restaurantId}/${im.index}`,
+    }))
+  );
+
+  const sig = images.map((im) => `${im.id}:${im.index}`).join(",");
+  useEffect(() => {
+    setLocal(
+      images.map((im) => ({
+        key: `s-${im.id}`,
+        url: `/api/media/${restaurantId}/${im.index}`,
+      }))
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sig]);
 
   function run(fn: (fd: FormData) => Promise<void>, fd: FormData, okText: string) {
     setBusy(true);
@@ -38,9 +60,10 @@ export default function MenuImagesPanel({
     startTransition(async () => {
       try {
         await fn(fd);
-        router.refresh();
         setMsg({ tone: "good", text: okText });
-      } catch {
+        router.refresh();
+      } catch (err) {
+        console.error(err);
         setMsg({ tone: "bad", text: "Something went wrong, please try again." });
       } finally {
         setBusy(false);
@@ -64,16 +87,24 @@ export default function MenuImagesPanel({
       setMsg({ tone: "bad", text: "Choose at least one image first." });
       return;
     }
+    const fileList = Array.from(files);
+    setLocal((prev) => [
+      ...prev,
+      ...fileList.map((f) => ({
+        key: `l-${Math.random().toString(36).slice(2)}`,
+        url: URL.createObjectURL(f),
+      })),
+    ]);
+    if (fileRef.current) fileRef.current.value = "";
+
     const fd = new FormData();
     fd.set("restaurantId", restaurantId);
-    for (const f of Array.from(files)) {
-      fd.append("images", f);
-    }
-    run(addMenuImages, fd, `Added ${files.length} menu image(s).`);
-    if (fileRef.current) fileRef.current.value = "";
+    for (const f of fileList) fd.append("images", f);
+    run(addMenuImages, fd, `Added ${fileList.length} menu image(s).`);
   }
 
   function removeImage(index: number) {
+    setLocal((prev) => prev.filter((_, i) => i !== index));
     const fd = new FormData();
     fd.set("restaurantId", restaurantId);
     fd.set("index", String(index));
@@ -125,10 +156,7 @@ export default function MenuImagesPanel({
         </button>
       </form>
 
-      <form
-        onSubmit={submitUpload}
-        className="mb-4 flex flex-wrap items-end gap-3"
-      >
+      <form onSubmit={submitUpload} className="mb-4 flex flex-wrap items-end gap-3">
         <input
           ref={fileRef}
           type="file"
@@ -142,27 +170,28 @@ export default function MenuImagesPanel({
           disabled={busy}
           className="rounded-lg border border-line px-3.5 py-2 text-sm font-medium text-soft transition-colors hover:bg-surface disabled:opacity-50"
         >
-          Add images
+          {busy ? "Working…" : "Add images"}
         </button>
       </form>
 
       <div className="grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-6">
-        {images.length === 0 ? (
+        {local.length === 0 ? (
           <p className="col-span-full text-xs text-muted">No menu images uploaded yet.</p>
         ) : (
-          images.map((img) => (
+          local.map((img, i) => (
             <div
-              key={img.id}
+              key={img.key}
               className="group relative overflow-hidden rounded-lg border border-line"
             >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
-                src={`/api/media/${restaurantId}/${img.index}`}
+                src={img.url}
                 alt="Menu"
                 className="aspect-square w-full object-cover"
               />
               <button
                 type="button"
-                onClick={() => removeImage(img.index)}
+                onClick={() => removeImage(i)}
                 title="Remove image"
                 className="absolute right-1 top-1 rounded-md bg-black/60 px-1.5 py-0.5 text-xs text-white opacity-0 transition-opacity hover:bg-bad group-hover:opacity-100"
               >
