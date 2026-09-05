@@ -1,0 +1,7 @@
+# The gateway is deployed separately (Render) — keep it out of Vercel.
+gateway
+scripts
+dev.db
+*.db
+drizzle
+render.yaml

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: repli-gateway
+    runtime: node
+    rootDir: gateway
+    healthCheckPath: /health
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PLATFORM_URL
+        value: https://watsinstaassitant.vercel.app
+      - key: GATEWAY_SECRET
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: NODE_ENV
+        value: production
