@@ -3,6 +3,8 @@ import { Badge, Card } from "@/components/ui";
 import { getRestaurantsOverview } from "@/lib/queries";
 import { formatDateTime, formatMoney } from "@/lib/utils";
 
+export const dynamic = "force-dynamic";
+
 function SubBadge({ daysLeft, expired, active }: { daysLeft: number; expired: boolean; active: boolean }) {
   if (!active) return <Badge tone="neutral">Paused</Badge>;
   if (expired) return <Badge tone="bad">Subscription expired</Badge>;

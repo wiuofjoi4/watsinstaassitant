@@ -8,6 +8,8 @@ import { getConversationThread } from "@/lib/queries";
 import { formatDateTime } from "@/lib/utils";
 import { first } from "@/lib/db/query";
 
+export const dynamic = "force-dynamic";
+
 export default async function ConversationPage(
   props: PageProps<"/admin/restaurants/[id]/conversation/[conversationId]">
 ) {

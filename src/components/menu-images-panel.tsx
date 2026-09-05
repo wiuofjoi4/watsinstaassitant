@@ -32,7 +32,7 @@ export default function MenuImagesPanel({
 }) {
   const router = useRouter();
   const fileRef = useRef<HTMLInputElement>(null);
-  const [busy, setBusy] = useState(false);
+  const runningRef = useRef(false);
   const [wa, setWa] = useState(autoWhatsapp);
   const [ig, setIg] = useState(autoInstagram);
   const [msg, setMsg] = useState<{ tone: "good" | "bad"; text: string } | null>(null);
@@ -55,18 +55,21 @@ export default function MenuImagesPanel({
   }, [sig]);
 
   function run(fn: (fd: FormData) => Promise<void>, fd: FormData, okText: string) {
-    setBusy(true);
-    setMsg(null);
+    if (runningRef.current) return;
+    runningRef.current = true;
+    setMsg({ tone: "good", text: okText });
     startTransition(async () => {
       try {
         await fn(fd);
-        setMsg({ tone: "good", text: okText });
         router.refresh();
       } catch (err) {
         console.error(err);
-        setMsg({ tone: "bad", text: "Something went wrong, please try again." });
+        setMsg({
+          tone: "bad",
+          text: "Saved locally but syncing failed — a page refresh will retry.",
+        });
       } finally {
-        setBusy(false);
+        runningRef.current = false;
       }
     });
   }
@@ -77,7 +80,7 @@ export default function MenuImagesPanel({
     fd.set("restaurantId", restaurantId);
     if (wa) fd.set("autoMenuWhatsapp", "on");
     if (ig) fd.set("autoMenuInstagram", "on");
-    run(saveMenuPrefs, fd, "Menu auto-send preferences saved.");
+    run(saveMenuPrefs, fd, "Menu auto-send preferences saved ✓");
   }
 
   function submitUpload(e: React.FormEvent<HTMLFormElement>) {
@@ -95,12 +98,15 @@ export default function MenuImagesPanel({
         url: URL.createObjectURL(f),
       })),
     ]);
-    if (fileRef.current) fileRef.current.value = "";
+    const clearFile = () => {
+      if (fileRef.current) fileRef.current.value = "";
+    };
+    clearFile();
 
     const fd = new FormData();
     fd.set("restaurantId", restaurantId);
     for (const f of fileList) fd.append("images", f);
-    run(addMenuImages, fd, `Added ${fileList.length} menu image(s).`);
+    run(addMenuImages, fd, `Added ${fileList.length} menu image(s) ✓`);
   }
 
   function removeImage(index: number) {
@@ -108,7 +114,7 @@ export default function MenuImagesPanel({
     const fd = new FormData();
     fd.set("restaurantId", restaurantId);
     fd.set("index", String(index));
-    run(removeMenuImage, fd, "Menu image removed.");
+    run(removeMenuImage, fd, "Menu image removed ✓");
   }
 
   return (
@@ -149,8 +155,7 @@ export default function MenuImagesPanel({
         </label>
         <button
           type="submit"
-          disabled={busy}
-          className="ml-auto rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent disabled:opacity-50"
+          className="ml-auto rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent"
         >
           Save preferences
         </button>
@@ -167,10 +172,9 @@ export default function MenuImagesPanel({
         />
         <button
           type="submit"
-          disabled={busy}
-          className="rounded-lg border border-line px-3.5 py-2 text-sm font-medium text-soft transition-colors hover:bg-surface disabled:opacity-50"
+          className="rounded-lg border border-line px-3.5 py-2 text-sm font-medium text-soft transition-colors hover:bg-surface"
         >
-          {busy ? "Working…" : "Add images"}
+          Add images
         </button>
       </form>
 

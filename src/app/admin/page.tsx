@@ -7,6 +7,8 @@ import {
 } from "@/lib/queries";
 import { formatMoney } from "@/lib/utils";
 
+export const dynamic = "force-dynamic";
+
 export default async function DashboardPage() {
   const stats = await getDashboardStats();
   const restaurants = await getRestaurantsOverview();

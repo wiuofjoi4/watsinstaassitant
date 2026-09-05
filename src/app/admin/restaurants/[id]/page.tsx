@@ -22,6 +22,8 @@ import { formatDateTime, formatMoney } from "@/lib/utils";
 
 const TABS = ["overview", "agent", "conversations", "orders", "errors", "usage"] as const;
 
+export const dynamic = "force-dynamic";
+
 export default async function RestaurantDetailPage(
   props: PageProps<"/admin/restaurants/[id]">
 ) {
