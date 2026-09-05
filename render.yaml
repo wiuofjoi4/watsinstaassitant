@@ -4,7 +4,7 @@ services:
     runtime: node
     rootDir: gateway
     healthCheckPath: /health
-    buildCommand: npm install
+    buildCommand: npm install --include=dev
     startCommand: npm start
     envVars:
       - key: PLATFORM_URL

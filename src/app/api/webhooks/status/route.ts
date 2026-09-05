@@ -35,19 +35,30 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Missing fields" }, { status: 400 });
   }
 
-  const col = body.channel === "whatsapp" ? restaurants.whatsappStatus : restaurants.instagramStatus;
-  const linkedCol =
-    body.channel === "whatsapp" ? restaurants.whatsappLinked : restaurants.instagramLinked;
-  const jidCol = body.channel === "whatsapp" ? restaurants.whatsappJid : restaurants.instagramUsername;
+  const status =
+    body.event === "connected" ? "connected" : body.event === "qr_ready" ? "waiting" : "disconnected";
+  const linked =
+    body.event === "connected" ? true : body.event === "disconnected" ? false : undefined;
 
-  await db
-    .update(restaurants)
-    .set({
-      [col.name]: body.event === "connected" ? "connected" : body.event === "qr_ready" ? "waiting" : "disconnected",
-      [linkedCol.name]: body.event === "connected" ? true : body.event === "disconnected" ? false : undefined,
-      [jidCol.name]: body.jid ?? body.username ?? undefined,
-    })
-    .where(eq(restaurants.id, body.restaurantId));
+  if (body.channel === "whatsapp") {
+    await db
+      .update(restaurants)
+      .set({
+        whatsappStatus: status,
+        whatsappLinked: linked === undefined ? undefined : linked,
+        whatsappJid: body.jid ?? undefined,
+      })
+      .where(eq(restaurants.id, body.restaurantId));
+  } else {
+    await db
+      .update(restaurants)
+      .set({
+        instagramStatus: status,
+        instagramLinked: linked === undefined ? undefined : linked,
+        instagramUsername: body.username ?? undefined,
+      })
+      .where(eq(restaurants.id, body.restaurantId));
+  }
 
   return NextResponse.json({ ok: true });
 }
