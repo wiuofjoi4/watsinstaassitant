@@ -38,6 +38,9 @@ interface Session {
   connected: boolean;
   lastJid: string | null;
   startedAt: number;
+  connectionState?: string;
+  lastError?: string;
+  qrOnce?: boolean;
 }
 
 const sessions = new Map<string, Session>();
@@ -110,12 +113,19 @@ async function startSession(restaurantId: string): Promise<void> {
   const auth = new PgAuthState(restaurantId, sql);
   await auth.ready;
 
-  const socket = makeWASocket({
-    logger,
-    auth: auth.state,
-    browser: Browsers.ubuntu("Chrome"),
-    syncFullHistory: false,
-  });
+  let socket: WASocket;
+  try {
+    socket = makeWASocket({
+      logger,
+      auth: auth.state,
+      browser: Browsers.ubuntu("Chrome"),
+      syncFullHistory: false,
+    });
+  } catch (err) {
+    logger.error(`makeWASocket threw for ${restaurantId}: ${String(err)}`);
+    setTimeout(() => startSession(restaurantId), 10_000);
+    return;
+  }
 
   const session: Session = {
     socket,
@@ -132,8 +142,13 @@ async function startSession(restaurantId: string): Promise<void> {
 
   socket.ev.on("connection.update", (update) => {
     const { connection, lastDisconnect, qr } = update;
+    session.connectionState = connection ?? session.connectionState;
+    if (lastDisconnect?.error) {
+      session.lastError = `${String(lastDisconnect.error)}`;
+    }
     if (qr) {
       session.qr = qr;
+      session.qrOnce = true;
       void postStatus(restaurantId, "qr_ready");
     }
     if (connection === "open") {
@@ -314,6 +329,15 @@ app.get("/health", async (_req, res) => {
     sessions: sessions.size,
     connected: [...sessions.values()].filter((s) => s.connected).length,
     uptime: Math.round(process.uptime()),
+    states: [...sessions.values()].map((s) => ({
+      restaurantId: s.restaurantId,
+      connection: s.connectionState ?? "pending",
+      hasQr: !!s.qr,
+      qrOnce: !!s.qrOnce,
+      connected: s.connected,
+      ageSeconds: Math.round((Date.now() - s.startedAt) / 1000),
+      lastError: s.lastError ?? null,
+    })),
   });
 });
 
@@ -426,6 +450,14 @@ async function shutdown(): Promise<void> {
 
 process.on("SIGTERM", () => void shutdown());
 process.on("SIGINT", () => void shutdown());
+
+process.on("unhandledRejection", (err) => {
+  logger.error(`unhandledRejection: ${String(err)}`);
+});
+
+process.on("uncaughtException", (err) => {
+  logger.error(`uncaughtException: ${String(err)}`);
+});
 
 app.listen(PORT, () => {
   logger.info(`Repli gateway listening on :${PORT}`);
