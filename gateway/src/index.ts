@@ -45,6 +45,30 @@ interface Session {
 
 const sessions = new Map<string, Session>();
 
+interface RecentEvent {
+  at: string;
+  connection?: string;
+  errorCode?: number;
+  error?: string;
+}
+const recent = new Map<string, RecentEvent>();
+
+function recordClose(restaurantId: string, connection: string | undefined, lastDisconnect?: unknown): void {
+  const errObj = lastDisconnect as { error?: { output?: { statusCode?: number }; message?: string; stack?: string }; message?: string } | null;
+  const code = errObj?.error?.output?.statusCode;
+  const errText =
+    errObj?.error?.message ??
+    errObj?.error?.stack?.split("\n")[0] ??
+    errObj?.message ??
+    (errObj?.error ? JSON.stringify(errObj.error).slice(0, 400) : null);
+  recent.set(restaurantId, {
+    at: new Date().toISOString(),
+    connection,
+    errorCode: code,
+    error: errText ?? undefined,
+  });
+}
+
 function headers(): Record<string, string> {
   return {
     "content-type": "application/json",
@@ -160,6 +184,7 @@ async function startSession(restaurantId: string): Promise<void> {
     }
     if (connection === "close") {
       session.connected = false;
+      recordClose(restaurantId, connection, lastDisconnect);
       void postStatus(restaurantId, "disconnected");
       sessions.delete(restaurantId);
       void session.socket.end(undefined);
@@ -337,6 +362,13 @@ app.get("/health", async (_req, res) => {
       connected: s.connected,
       ageSeconds: Math.round((Date.now() - s.startedAt) / 1000),
       lastError: s.lastError ?? null,
+    })),
+    recent: [...recent.entries()].map(([restaurantId, ev]) => ({
+      restaurantId,
+      at: ev.at,
+      connection: ev.connection ?? null,
+      errorCode: ev.errorCode ?? null,
+      error: ev.error ?? null,
     })),
   });
 });
