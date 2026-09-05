@@ -574,7 +574,7 @@ export async function handleIncomingMessage(
     for (let i = 0; i < rawMenuImages.length; i++) {
       const img = rawMenuImages[i];
       if (!img.base64) continue;
-      const url = `${appBase}/api/media/${profile.restaurant.id}/${i}`;
+      const url = `${appBase}/api/media/${profile.restaurant.id}/${img.id}`;
       menuImages.push({
         id: img.id,
         mime: img.mime,

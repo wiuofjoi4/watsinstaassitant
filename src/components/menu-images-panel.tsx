@@ -39,7 +39,7 @@ export default function MenuImagesPanel({
   const [local, setLocal] = useState<LocalImage[]>(() =>
     images.map((im) => ({
       key: `s-${im.id}`,
-      url: `/api/media/${restaurantId}/${im.index}`,
+      url: `/api/media/${restaurantId}/${im.id}`,
     }))
   );
 
@@ -48,7 +48,7 @@ export default function MenuImagesPanel({
     setLocal(
       images.map((im) => ({
         key: `s-${im.id}`,
-        url: `/api/media/${restaurantId}/${im.index}`,
+        url: `/api/media/${restaurantId}/${im.id}`,
       }))
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps

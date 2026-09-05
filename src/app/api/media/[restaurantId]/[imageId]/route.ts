@@ -26,21 +26,17 @@ function parseMenuImages(raw: string | null | undefined): MenuImageRaw[] {
 
 export async function GET(
   _req: Request,
-  ctx: { params: Promise<{ restaurantId: string; index: string }> }
+  ctx: { params: Promise<{ restaurantId: string; imageId: string }> }
 ) {
-  const { restaurantId, index } = await ctx.params;
+  const { restaurantId, imageId } = await ctx.params;
   const restaurant = await first(
     db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
   );
   if (!restaurant) return new Response("Not found", { status: 404 });
 
   const images = parseMenuImages(restaurant.menuImages);
-  const i = Number(index);
-  if (!Number.isInteger(i) || i < 0 || i >= images.length) {
-    return new Response("Not found", { status: 404 });
-  }
-
-  const img = images[i];
+  const img = images.find((x) => x.id === imageId);
+  if (!img) return new Response("Not found", { status: 404 });
   const buf = Buffer.from(img.base64, "base64");
   return new Response(new Uint8Array(buf), {
     status: 200,
