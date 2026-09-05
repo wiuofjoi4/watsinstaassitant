@@ -59,6 +59,21 @@ export class PgAuthState {
     await this.persist();
   }
 
+  /**
+   * Delete any stored session state for this restaurant so the next pairing
+   * starts from completely fresh (unregistered) credentials that can show a
+   * QR again. Used when the owner unlinks the device or we need a new QR.
+   */
+  async discard(): Promise<void> {
+    if (this.sql == null) return;
+    try {
+      await this.sql`DELETE FROM repli.gateway_sessions
+        WHERE restaurant_id = ${this.restaurantId} AND channel = 'whatsapp'`;
+    } catch (err) {
+      logger.warn(`session discard failed for ${this.restaurantId}: ${String(err)}`);
+    }
+  }
+
   private keyStore(): SignalKeyStore & SignalKeyStoreWithTransaction {
     return {
       get: async (type, ids) => {

@@ -124,7 +124,7 @@ function ensureSession(restaurantId: string): void {
     // Alive but stuck (e.g. restored creds hit logged-out) → drop stored creds
     // and restart so the owner gets a fresh QR.
     try {
-      void existing.auth.flush();
+      void existing.auth.discard();
       existing.socket.end(undefined);
     } catch {}
     sessions.delete(restaurantId);
@@ -198,9 +198,12 @@ async function startSession(restaurantId: string): Promise<void> {
         // The owner removed the device from WhatsApp → drop stored creds so a
         // fresh QR is generated for re-pairing.
         try {
-          void session.auth.flush();
-        } catch {}
-        setTimeout(() => startSession(restaurantId), 2_000);
+          void session.auth.discard().then(() => {
+            setTimeout(() => startSession(restaurantId), 2_000);
+          });
+        } catch {
+          setTimeout(() => startSession(restaurantId), 2_000);
+        }
       }
     }
   });
@@ -456,7 +459,7 @@ async function loop() {
         const s = sessions.get(r.id);
         if (s) {
           try {
-            void s.auth.flush();
+            void s.auth.discard();
             s.socket.end(undefined);
           } catch {}
           sessions.delete(s.restaurantId);
