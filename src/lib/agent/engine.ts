@@ -13,9 +13,10 @@ import { newId } from "@/lib/utils";
 import { first } from "@/lib/db/query";
 import { buildSystemPrompt, type BusinessProfile } from "./prompt";
 import {
-  AGENT_MODEL,
   estimateCostUsd,
+  getAgentModel,
   getOpenAI,
+  getProvider,
   TRANSCRIBE_MODEL,
 } from "@/lib/ai/client";
 
@@ -182,22 +183,46 @@ async function transcribeVoice(input: IncomingMessageInput): Promise<string | nu
   if (!fileData || fileData.length === 0) return null;
 
   const mime = input.mediaMime ?? "audio/mpeg";
-  const plain = fileData.buffer.slice(
-    fileData.byteOffset,
-    fileData.byteOffset + fileData.byteLength
-  ) as ArrayBuffer;
-  const blob = new Blob([plain], { type: mime });
-  const file = new File([blob], `voice.${(mime.split("/")[1] ?? "mp3").replace("mp4", "m4a")}`, {
-    type: mime,
-  });
+  const format = (mime.split("/")[1] ?? "mpeg").replace("mp4", "m4a");
 
   try {
+    if (getProvider() === "gemini") {
+      const res = await client.chat.completions.create({
+        model: getAgentModel(),
+        temperature: 0,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a speech-to-text engine. Reply with ONLY the exact transcription text, no commentary.",
+          },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Transcribe this audio." },
+              { type: "input_audio", input_audio: { data: fileData.toString("base64"), format } },
+            ] as never,
+          } as OpenAI.Chat.Completions.ChatCompletionMessageParam,
+        ],
+      });
+      return res.choices[0]?.message?.content?.trim() || null;
+    }
+
+    const plain = fileData.buffer.slice(
+      fileData.byteOffset,
+      fileData.byteOffset + fileData.byteLength
+    ) as ArrayBuffer;
+    const blob = new Blob([plain], { type: mime });
+    const file = new File([blob], `voice.${format}`, {
+      type: mime,
+    });
     const transcription = await client.audio.transcriptions.create({
       model: TRANSCRIBE_MODEL,
       file,
     });
     return transcription.text || null;
-  } catch {
+  } catch (err) {
+    console.error("transcribe error", err);
     return null;
   }
 }
@@ -301,7 +326,7 @@ async function extractOrder(
 
   try {
     const res = await client.chat.completions.create({
-      model: AGENT_MODEL,
+      model: getAgentModel(),
       temperature: 0,
       response_format: { type: "json_object" },
       messages: [
@@ -331,7 +356,7 @@ export async function handleIncomingMessage(
 ): Promise<RunResult | null> {
   const profile = await getBusiness(input.restaurantId);
   if (!profile) return null;
-  if (!profile.restaurant.agentEnabled) return { replyText: "", costUsd: 0, model: AGENT_MODEL };
+  if (!profile.restaurant.agentEnabled) return { replyText: "", costUsd: 0, model: getAgentModel() };
 
   const conversation = await upsertConversation(
     input.restaurantId,
@@ -363,7 +388,7 @@ export async function handleIncomingMessage(
   const client = getOpenAI();
   let replyText = "";
   let costUsd = 0;
-  const usedModel = AGENT_MODEL;
+  const usedModel = getAgentModel();
 
   if (!client || effectiveText.trim() === "") {
     replyText =
@@ -372,7 +397,7 @@ export async function handleIncomingMessage(
     try {
       const messagesList = await buildMessages(profile, conversation.id, input);
       const res = await client.chat.completions.create({
-        model: AGENT_MODEL,
+        model: getAgentModel(),
         temperature: profile.config.temperature,
         messages: messagesList,
       });
