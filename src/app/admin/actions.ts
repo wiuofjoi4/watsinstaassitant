@@ -238,3 +238,86 @@ export async function resolveError(formData: FormData) {
     .where(eq(errorLogs.id, errorId));
   revalidatePath(`/admin/restaurants/${String(formData.get("restaurantId") ?? "")}?tab=errors`);
 }
+
+interface MenuImageRaw {
+  id: string;
+  mime: string;
+  base64: string;
+}
+
+function parseMenuImages(raw: string | null | undefined): MenuImageRaw[] {
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw) as MenuImageRaw[];
+    if (!Array.isArray(arr)) return [];
+    return arr.filter(
+      (x) => x && typeof x.base64 === "string" && typeof x.mime === "string"
+    );
+  } catch {
+    return [];
+  }
+}
+
+const MAX_MENU_IMAGES = 8;
+const MAX_IMAGE_BYTES = 2.5 * 1024 * 1024;
+
+export async function saveMenuPrefs(formData: FormData) {
+  await guard();
+  const restaurantId = String(formData.get("restaurantId"));
+  await db
+    .update(restaurants)
+    .set({
+      autoMenuWhatsapp: formData.get("autoMenuWhatsapp") === "on",
+      autoMenuInstagram: formData.get("autoMenuInstagram") === "on",
+    })
+    .where(eq(restaurants.id, restaurantId));
+  revalidatePath(`/admin/restaurants/${restaurantId}`);
+}
+
+export async function addMenuImages(formData: FormData) {
+  await guard();
+  const restaurantId = String(formData.get("restaurantId"));
+  const restaurant = await first(
+    db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
+  );
+  if (!restaurant) return;
+
+  const current = parseMenuImages(restaurant.menuImages);
+  const files = formData.getAll("images") as File[];
+  const added: MenuImageRaw[] = [];
+  for (const file of files) {
+    if (current.length + added.length >= MAX_MENU_IMAGES) break;
+    if (!file.type.startsWith("image/")) continue;
+    if (file.size <= 0 || file.size > MAX_IMAGE_BYTES) continue;
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    added.push({
+      id: newId(),
+      mime: file.type,
+      base64: Buffer.from(bytes).toString("base64"),
+    });
+  }
+  if (added.length === 0) return;
+
+  await db
+    .update(restaurants)
+    .set({ menuImages: JSON.stringify([...current, ...added]) })
+    .where(eq(restaurants.id, restaurantId));
+  revalidatePath(`/admin/restaurants/${restaurantId}`);
+}
+
+export async function removeMenuImage(formData: FormData) {
+  await guard();
+  const restaurantId = String(formData.get("restaurantId"));
+  const index = Number(formData.get("index"));
+  const restaurant = await first(
+    db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
+  );
+  if (!restaurant) return;
+  const current = parseMenuImages(restaurant.menuImages);
+  if (!Number.isInteger(index) || index < 0 || index >= current.length) return;
+  await db
+    .update(restaurants)
+    .set({ menuImages: JSON.stringify(current.filter((_, i) => i !== index)) })
+    .where(eq(restaurants.id, restaurantId));
+  revalidatePath(`/admin/restaurants/${restaurantId}`);
+}

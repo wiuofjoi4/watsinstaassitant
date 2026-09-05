@@ -62,6 +62,10 @@ export async function POST(req: Request) {
 
     return NextResponse.json({
       reply: result?.replyText ? { text: result.replyText } : null,
+      images: (result?.menuImages ?? []).map((i) => ({
+        base64: i.base64,
+        mime: i.mime,
+      })),
       agency: result?.order ?? null,
       generatedPrice: result?.costUsd ?? 0,
     });

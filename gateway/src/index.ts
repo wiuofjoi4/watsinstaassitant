@@ -260,9 +260,14 @@ async function deliver(
       logger.error(`webhook message returned ${res.status}`);
       return false;
     }
-    const data = (await res.json()) as { reply?: { text?: string } | null };
+    const data = (await res.json()) as {
+      reply?: { text?: string } | null;
+      images?: Array<{ base64?: string; mime?: string }>;
+    };
     const replyText = data.reply?.text;
-    if (!replyText || replyText.trim().length === 0) return false;
+    if ((!replyText || replyText.trim().length === 0) && !data.images?.length) {
+      return false;
+    }
 
     const session = sessions.get(restaurantId);
     if (!session) return false;
@@ -271,7 +276,18 @@ async function deliver(
     const delay = 800 + Math.floor(Math.random() * 1800);
     await new Promise((r) => setTimeout(r, delay));
 
-    await session.socket.sendMessage(remoteJid, { text: replyText });
+    for (const img of data.images ?? []) {
+      if (!img.base64) continue;
+      const buf = Buffer.from(img.base64, "base64");
+      if (buf.length === 0) continue;
+      await session.socket.sendMessage(remoteJid, {
+        image: buf,
+        mimetype: img.mime ?? "image/jpeg",
+      });
+    }
+    if (replyText) {
+      await session.socket.sendMessage(remoteJid, { text: replyText });
+    }
     return true;
   } catch (err) {
     logger.error(`deliver failed: ${String(err)}`);

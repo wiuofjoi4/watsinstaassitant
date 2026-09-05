@@ -37,6 +37,45 @@ export async function sendInstagramText({
   }
 }
 
+export interface SendInstagramImageInput {
+  igId: string;
+  accessToken: string;
+  recipientId: string;
+  imageUrl: string;
+}
+
+export async function sendInstagramImage({
+  igId,
+  accessToken,
+  recipientId,
+  imageUrl,
+}: SendInstagramImageInput): Promise<{ ok: boolean; messageId?: string; error?: string }> {
+  const url = `https://graph.instagram.com/${INSTAGRAM_GRAPH_VERSION}/${igId}/messages`;
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        recipient: { id: recipientId },
+        message: {
+          attachment: {
+            type: "image",
+            payload: { url: imageUrl },
+          },
+        },
+      }),
+    });
+    const json = (await res.json().catch(() => null)) as { message_id?: string; error?: { message?: string } } | null;
+    if (!res.ok) return { ok: false, error: json?.error?.message ?? `HTTP ${res.status}` };
+    return { ok: true, messageId: json?.message_id };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export function verifyHubSignature(
   appSecret: string,
   rawBody: string,

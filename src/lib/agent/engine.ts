@@ -53,6 +53,32 @@ export interface AgentReply {
   usedModel: string;
 }
 
+export interface MenuImage {
+  id: string;
+  mime: string;
+  base64: string;
+  url: string;
+}
+
+interface MenuImageRaw {
+  id: string;
+  mime: string;
+  base64: string;
+}
+
+function parseMenuImages(raw: string | null | undefined): MenuImageRaw[] {
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw) as MenuImageRaw[];
+    if (!Array.isArray(arr)) return [];
+    return arr.filter(
+      (x) => x && typeof x.base64 === "string" && typeof x.mime === "string"
+    );
+  } catch {
+    return [];
+  }
+}
+
 const HISTORY_LIMIT = 24;
 
 async function getBusiness(restaurantId: string): Promise<BusinessProfile | null> {
@@ -243,7 +269,8 @@ function toHistory(rows: { direction: string; text: string | null }[]): OpenAI.C
 async function buildMessages(
   profile: BusinessProfile,
   conversationId: string,
-  input: IncomingMessageInput
+  input: IncomingMessageInput,
+  menuNote?: string
 ): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam[]> {
   const historyRows = await db
     .select({ direction: messages.direction, text: messages.text })
@@ -255,7 +282,9 @@ async function buildMessages(
   const history = historyRows.reverse();
   const historyMessages = toHistory(history);
 
-  const systemPrompt = profile.config.systemPrompt || buildSystemPrompt(profile);
+  const systemPrompt =
+    (profile.config.systemPrompt || buildSystemPrompt(profile)) +
+    (menuNote ? `\n\n${menuNote}` : "");
   const currentUserText = input.text ?? "";
 
   let content: OpenAI.Chat.Completions.ChatCompletionUserMessageParam["content"] =
@@ -293,6 +322,7 @@ export interface RunResult {
   order?: AgentOrderResult | null;
   costUsd: number;
   model: string;
+  menuImages?: MenuImage[];
   createOrderProps?: Partial<{
     customerName: string | null;
     phone: string | null;
@@ -351,6 +381,53 @@ async function extractOrder(
   }
 }
 
+async function isOrderMessage(
+  profile: BusinessProfile,
+  conversationId: string,
+  currentText: string
+): Promise<boolean> {
+  const client = getOpenAI();
+  if (!client) return false;
+  const trimmed = currentText.trim();
+  if (!trimmed) return false;
+
+  const historyRows = await db
+    .select({ direction: messages.direction, text: messages.text })
+    .from(messages)
+    .where(eq(messages.conversationId, conversationId))
+    .orderBy(desc(messages.createdAt))
+    .limit(14);
+  const historyMessages = toHistory(historyRows.reverse()).slice(-10);
+
+  try {
+    const res = await client.chat.completions.create({
+      model: getAgentModel(),
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content: [
+            `You classify a restaurant customer's latest message.`,
+            `"isOrder": true only when the customer is requesting to PURCHASE/ORDER food items now (e.g. "أريد 2 شاورما", "أبغى برغر كبير", "اطلب لي كولا", "نعم أريد أن أطلب").`,
+            `"isOrder": false for questions and small talk (e.g. "مرحبا", "عندكم منيو؟", "كم سعر الشاورما؟", "وش تعملون؟").`,
+            `Reply only with JSON: {"isOrder": true or false}.`,
+          ].join("\n"),
+        },
+        ...historyMessages,
+        { role: "user", content: trimmed },
+      ],
+    });
+    const raw = res.choices[0]?.message?.content ?? "";
+    const parsed = JSON.parse(
+      raw.startsWith("```") ? raw.replace(/```json|```/g, "").trim() : raw
+    ) as { isOrder?: boolean };
+    return parsed.isOrder === true;
+  } catch {
+    return false;
+  }
+}
+
 export async function handleIncomingMessage(
   input: IncomingMessageInput
 ): Promise<RunResult | null> {
@@ -390,12 +467,50 @@ export async function handleIncomingMessage(
   let costUsd = 0;
   const usedModel = getAgentModel();
 
+  let sendMenuImages = false;
+  const rawMenuImages = parseMenuImages(profile.restaurant.menuImages);
+  const menuToggle =
+    input.channel === "whatsapp"
+      ? profile.restaurant.autoMenuWhatsapp
+      : profile.restaurant.autoMenuInstagram;
+  if (menuToggle && rawMenuImages.length > 0 && client) {
+    const lastOut = await first(
+      db
+        .select({ contentType: messages.contentType })
+        .from(messages)
+        .where(
+          and(
+            eq(messages.conversationId, conversation.id),
+            eq(messages.direction, "out")
+          )
+        )
+        .orderBy(desc(messages.createdAt))
+        .limit(1)
+    );
+    const alreadySentMenu = lastOut?.contentType === "image";
+    if (!alreadySentMenu) {
+      const isOrder = await isOrderMessage(
+        profile,
+        conversation.id,
+        effectiveText
+      );
+      sendMenuImages = !isOrder;
+    }
+  }
+
   if (!client || effectiveText.trim() === "") {
     replyText =
       "Sorry, I couldn't process that. Could you send it again as text? 😊";
   } else {
     try {
-      const messagesList = await buildMessages(profile, conversation.id, input);
+      const messagesList = await buildMessages(
+        profile,
+        conversation.id,
+        input,
+        sendMenuImages
+          ? `Note for THIS reply only: you will also send the customer the menu pictures along with your text. Acknowledge in one short line that you are sending the menu, and do NOT repeat the whole menu in text.`
+          : undefined
+      );
       const res = await client.chat.completions.create({
         model: getAgentModel(),
         temperature: profile.config.temperature,
@@ -452,8 +567,42 @@ export async function handleIncomingMessage(
       });
   }
 
+  const menuImages: MenuImage[] = [];
+  if (sendMenuImages) {
+    const appBase = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
+    const base = new Date().getTime();
+    for (let i = 0; i < rawMenuImages.length; i++) {
+      const img = rawMenuImages[i];
+      if (!img.base64) continue;
+      const url = `${appBase}/api/media/${profile.restaurant.id}/${i}`;
+      menuImages.push({
+        id: img.id,
+        mime: img.mime,
+        base64: img.base64,
+        url,
+      });
+      await db.insert(messages).values({
+        id: newId(),
+        conversationId: conversation.id,
+        direction: "out",
+        contentType: "image",
+        mediaUrl: url,
+        mediaMime: img.mime,
+        status: "sent",
+        createdAt: new Date(base + i + 1),
+      });
+    }
+  }
+
   if (conversation.status === "manual") {
-    return { replyText: "", costUsd, model: usedModel, transcription, order: null };
+    return {
+      replyText: "",
+      costUsd,
+      model: usedModel,
+      transcription,
+      order: null,
+      menuImages,
+    };
   }
 
   const order = await extractOrder(profile, conversation.id);
@@ -470,6 +619,7 @@ export async function handleIncomingMessage(
     order,
     costUsd,
     model: usedModel,
+    menuImages,
   };
 }
 

@@ -1,11 +1,14 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import {
+  addMenuImages,
   connectInstagram,
   disconnectInstagram,
   generateLink,
+  removeMenuImage,
   resolveError,
   saveAgentConfig,
+  saveMenuPrefs,
   setOrderStatus,
   toggleAgent,
 } from "@/app/admin/actions";
@@ -37,6 +40,8 @@ export default async function RestaurantDetailPage(
   const linkUrl = restaurant.linkToken
     ? `${appUrl}/link/${restaurant.linkToken}`
     : null;
+
+  const menuImages = parseMenuImages(restaurant.menuImages);
 
   return (
     <div className="mx-auto max-w-6xl space-y-6">
@@ -187,6 +192,83 @@ export default async function RestaurantDetailPage(
         )}
       </Card>
 
+      {/* Menu images + auto-send */}
+      <Card className="p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium text-soft">Menu images & auto-send</p>
+            <p className="mt-0.5 text-xs text-muted">
+              Upload the menu pictures. When enabled for a channel, the agent will
+              send them to any customer message that is not a direct order.
+            </p>
+          </div>
+        </div>
+
+        <form action={saveMenuPrefs} className="mb-5 flex flex-wrap items-center gap-6 rounded-lg border border-line bg-surface/60 p-4">
+          <input type="hidden" name="restaurantId" value={restaurant.id} />
+          <label className="flex items-center gap-2.5 text-sm text-soft">
+            <Toggle key={`mw-${restaurant.autoMenuWhatsapp}`} checked={restaurant.autoMenuWhatsapp} name="autoMenuWhatsapp" />
+            Auto-send on WhatsApp
+          </label>
+          <label className="flex items-center gap-2.5 text-sm text-soft">
+            <Toggle key={`mi-${restaurant.autoMenuInstagram}`} checked={restaurant.autoMenuInstagram} name="autoMenuInstagram" />
+            Auto-send on Instagram
+          </label>
+          <button
+            type="submit"
+            className="ml-auto rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent"
+          >
+            Save preferences
+          </button>
+        </form>
+
+        <div className="space-y-4">
+          <form action={addMenuImages} className="flex flex-wrap items-end gap-3" encType="multipart/form-data">
+            <input type="hidden" name="restaurantId" value={restaurant.id} />
+            <input
+              type="file"
+              name="images"
+              multiple
+              accept="image/*"
+              className="block w-full max-w-sm text-xs text-muted file:mr-3 file:rounded-lg file:border-0 file:bg-primary/10 file:px-3 file:py-2 file:text-xs file:font-medium file:text-primary"
+            />
+            <button
+              type="submit"
+              className="rounded-lg border border-line px-3.5 py-2 text-sm font-medium text-soft transition-colors hover:bg-surface"
+            >
+              Add images
+            </button>
+          </form>
+
+          <div className="grid grid-cols-3 gap-3 sm:grid-cols-4 md:grid-cols-6">
+            {menuImages.length === 0 ? (
+              <p className="col-span-full text-xs text-muted">No menu images uploaded yet.</p>
+            ) : (
+              menuImages.map((img, i) => (
+                <div key={img.id} className="group relative overflow-hidden rounded-lg border border-line">
+                  <img
+                    src={`${appUrl}/api/media/${restaurant.id}/${i}`}
+                    alt={`Menu ${i + 1}`}
+                    className="aspect-square w-full object-cover"
+                  />
+                  <form action={removeMenuImage} className="absolute right-1 top-1">
+                    <input type="hidden" name="restaurantId" value={restaurant.id} />
+                    <input type="hidden" name="index" value={i} />
+                    <button
+                      type="submit"
+                      title="Remove image"
+                      className="rounded-md bg-black/60 px-1.5 py-0.5 text-xs text-white opacity-0 transition-opacity hover:bg-bad group-hover:opacity-100"
+                    >
+                      ✕
+                    </button>
+                  </form>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+      </Card>
+
       {/* Tabs */}
       <div className="flex flex-wrap gap-1 border-b border-line">
         {TABS.map((t) => (
@@ -219,6 +301,25 @@ export default async function RestaurantDetailPage(
       )}
     </div>
   );
+}
+
+interface MenuImageRaw {
+  id: string;
+  mime: string;
+  base64: string;
+}
+
+function parseMenuImages(raw: string | null | undefined): MenuImageRaw[] {
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw) as MenuImageRaw[];
+    if (!Array.isArray(arr)) return [];
+    return arr.filter(
+      (x) => x && typeof x.base64 === "string" && typeof x.mime === "string"
+    );
+  } catch {
+    return [];
+  }
 }
 
 function StatusChip({

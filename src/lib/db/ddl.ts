@@ -141,5 +141,11 @@ ALTER TABLE "repli"."restaurants" ADD COLUMN IF NOT EXISTS "instagram_token" tex
 --> statement-breakpoint
 ALTER TABLE "repli"."restaurants" ADD COLUMN IF NOT EXISTS "instagram_ig_id" text;
 --> statement-breakpoint
+ALTER TABLE "repli"."restaurants" ADD COLUMN IF NOT EXISTS "menu_images" text DEFAULT '[]' NOT NULL;
+--> statement-breakpoint
+ALTER TABLE "repli"."restaurants" ADD COLUMN IF NOT EXISTS "auto_menu_whatsapp" boolean DEFAULT false NOT NULL;
+--> statement-breakpoint
+ALTER TABLE "repli"."restaurants" ADD COLUMN IF NOT EXISTS "auto_menu_instagram" boolean DEFAULT false NOT NULL;
+--> statement-breakpoint
 CREATE INDEX "usage_logs_restaurant_idx" ON "repli"."usage_logs" USING btree ("restaurant_id","created_at");
 `;

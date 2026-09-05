@@ -5,6 +5,7 @@ import { restaurants } from "@/lib/db/schema";
 import { first } from "@/lib/db/query";
 import { handleIncomingMessage } from "@/lib/agent/engine";
 import {
+  sendInstagramImage,
   sendInstagramText,
   verifyHubSignature,
 } from "@/lib/instagram/client";
@@ -90,8 +91,9 @@ export async function POST(req: Request) {
         }
 
         let replyText = "";
+        let result: Awaited<ReturnType<typeof handleIncomingMessage>> | null = null;
         try {
-          const result = await handleIncomingMessage({
+          result = await handleIncomingMessage({
             restaurantId: restaurant.id,
             channel: "instagram",
             remoteJid: senderId,
@@ -113,6 +115,19 @@ export async function POST(req: Request) {
           });
           if (!sent.ok) {
             console.error("instagram webhook: send failed", sent.error);
+          }
+        }
+
+        for (const img of (result?.menuImages ?? []).slice(0, 6)) {
+          if (!restaurant.instagramToken) break;
+          const sentImg = await sendInstagramImage({
+            igId: restaurant.instagramIgId ?? igId,
+            accessToken: restaurant.instagramToken,
+            recipientId: senderId,
+            imageUrl: img.url,
+          });
+          if (!sentImg.ok) {
+            console.error("instagram webhook: image send failed", sentImg.error);
           }
         }
       }
