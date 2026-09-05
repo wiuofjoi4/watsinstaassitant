@@ -37,6 +37,7 @@ interface Session {
   qr: string | null;
   connected: boolean;
   lastJid: string | null;
+  startedAt: number;
 }
 
 const sessions = new Map<string, Session>();
@@ -89,7 +90,18 @@ async function postStatus(
 }
 
 function ensureSession(restaurantId: string): void {
-  if (sessions.has(restaurantId)) return;
+  const existing = sessions.get(restaurantId);
+  if (existing && (existing.connected || existing.qr)) return;
+  if (existing && Date.now() - existing.startedAt < 90_000) return;
+  if (existing) {
+    // Alive but stuck (e.g. restored creds hit logged-out) → drop stored creds
+    // and restart so the owner gets a fresh QR.
+    try {
+      void existing.auth.flush();
+      existing.socket.end(undefined);
+    } catch {}
+    sessions.delete(restaurantId);
+  }
   void startSession(restaurantId);
 }
 
@@ -112,6 +124,7 @@ async function startSession(restaurantId: string): Promise<void> {
     qr: null,
     connected: false,
     lastJid: null,
+    startedAt: Date.now(),
   };
   sessions.set(restaurantId, session);
 
@@ -141,6 +154,13 @@ async function startSession(restaurantId: string): Promise<void> {
       const shouldRetry = code === DisconnectReason.loggedOut ? false : true;
       if (shouldRetry) {
         setTimeout(() => startSession(restaurantId), 5_000);
+      } else {
+        // The owner removed the device from WhatsApp → drop stored creds so a
+        // fresh QR is generated for re-pairing.
+        try {
+          void session.auth.flush();
+        } catch {}
+        setTimeout(() => startSession(restaurantId), 2_000);
       }
     }
   });
