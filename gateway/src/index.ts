@@ -221,7 +221,7 @@ async function deliver(
   restaurantId: string,
   remoteJid: string,
   parsed: ParsedMessage
-): Promise<void> {
+): Promise<boolean> {
   try {
     const res = await fetch(`${PLATFORM_URL}/api/webhooks/message`, {
       method: "POST",
@@ -238,27 +238,30 @@ async function deliver(
     });
     if (!res.ok) {
       logger.error(`webhook message returned ${res.status}`);
-      return;
+      return false;
     }
     const data = (await res.json()) as { reply?: { text?: string } | null };
     const replyText = data.reply?.text;
-    if (!replyText || replyText.trim().length === 0) return;
+    if (!replyText || replyText.trim().length === 0) return false;
 
     const session = sessions.get(restaurantId);
-    if (!session) return;
+    if (!session) return false;
 
     // Human-like: small random delay before replying
     const delay = 800 + Math.floor(Math.random() * 1800);
     await new Promise((r) => setTimeout(r, delay));
 
     await session.socket.sendMessage(remoteJid, { text: replyText });
+    return true;
   } catch (err) {
     logger.error(`deliver failed: ${String(err)}`);
+    return false;
   }
 }
 
 // --- HTTP server: QR endpoint + health ---
 const app = express();
+app.use(express.json());
 
 app.get("/health", async (_req, res) => {
   let db = "ok";
@@ -302,6 +305,49 @@ app.get("/qr/:restaurantId/whatsapp", async (req, res) => {
 
 app.get("/qr/:restaurantId/:channel", (_req, res) => {
   res.status(404).json({ error: "Only whatsapp channel is supported for now" });
+});
+
+// Test-only endpoint: inject a synthetic inbound message and run the full
+// pipeline (handleMessage -> deliver -> agent reply -> real WhatsApp send).
+// Guarded by the gateway secret to prevent spam.
+app.post("/test/ingest", async (req, res) => {
+  const secretHeader = req.headers["x-gateway-secret"] ?? "";
+  if (secretHeader !== GATEWAY_SECRET) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  const restaurantId = (req.body?.restaurantId ?? "seed-restaurant-1") as string;
+  const text = (req.body?.text ?? "مرحبا، عندكم شاورما؟") as string;
+  const session = sessions.get(restaurantId);
+  if (!session) {
+    res.status(404).json({ error: "No active session" });
+    return;
+  }
+  const remoteJid = (req.body?.remoteJid ??
+    session.lastJid ??
+    session.socket.user?.id) as string;
+  if (!remoteJid) {
+    res.status(400).json({ error: "remoteJid unavailable" });
+    return;
+  }
+
+  try {
+    const synthetic = {
+      key: { remoteJid, fromMe: false, id: `test-${Date.now()}` },
+      message: { conversation: text },
+      messageTimestamp: Math.floor(Date.now() / 1000),
+    };
+    const parsed = await handleMessage(session, synthetic as any);
+    if (!parsed) {
+      res.status(422).json({ error: "Payload could not be parsed", remoteJid });
+      return;
+    }
+    const delivered = await deliver(restaurantId, remoteJid, parsed);
+    res.json({ ok: true, remoteJid, parsedText: parsed.text ?? null, delivered });
+  } catch (err) {
+    logger.error(`test/ingest failed: ${String(err)}`);
+    res.status(500).json({ error: String(err) });
+  }
 });
 
 // --- Platform sync loop ---
