@@ -13,7 +13,7 @@ import { newId } from "@/lib/utils";
 import { first } from "@/lib/db/query";
 import { buildSystemPrompt, type BusinessProfile } from "./prompt";
 import {
-  chatComplete,
+  completeWithFallback,
   estimateCostUsd,
   getAgentModel,
   getOpenAI,
@@ -214,7 +214,7 @@ async function transcribeVoice(input: IncomingMessageInput): Promise<string | nu
 
   try {
     if (getProvider() === "gemini") {
-      const res = await chatComplete(client, {
+      const res = await completeWithFallback(client, {
         model: getAgentModel(),
         temperature: 0,
         messages: [
@@ -356,7 +356,7 @@ async function extractOrder(
   });
 
   try {
-    const res = await chatComplete(client, {
+    const res = await completeWithFallback(client, {
       model: getAgentModel(),
       temperature: 0,
       response_format: { type: "json_object" },
@@ -401,7 +401,7 @@ async function isOrderMessage(
   const historyMessages = toHistory(historyRows.reverse()).slice(-10);
 
   try {
-    const res = await chatComplete(client, {
+    const res = await completeWithFallback(client, {
       model: getAgentModel(),
       temperature: 0,
       response_format: { type: "json_object" },
@@ -512,7 +512,7 @@ export async function handleIncomingMessage(
           ? `Note for THIS reply only: you will also send the customer the menu pictures along with your text. Acknowledge in one short line that you are sending the menu, and do NOT repeat the whole menu in text.`
           : undefined
       );
-      const res = await chatComplete(client, {
+      const res = await completeWithFallback(client, {
         model: getAgentModel(),
         temperature: profile.config.temperature,
         messages: messagesList,

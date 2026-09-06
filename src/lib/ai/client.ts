@@ -29,8 +29,36 @@ export const AGENT_MODEL = process.env.AGENT_MODEL ?? "gpt-4o";
 export const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.6-flash";
 export const TRANSCRIBE_MODEL = process.env.TRANSCRIBE_MODEL ?? "whisper-1";
 
+const GEMINI_FALLBACKS = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"];
+
+/**
+ * Ordered model candidates for the current provider. On Gemini, the chain
+ * includes extra free models so that when one model's daily quota is
+ * exhausted the agent can fall back to another. The starting position rotates
+ * daily so the load spreads across every model instead of one hogging all
+ * requests. Override with GEMINI_MODELS (comma-separated).
+ */
+function modelChain(): string[] {
+  const provider = getProvider();
+  if (provider === "openai") return [AGENT_MODEL];
+
+  const explicit = process.env.GEMINI_MODELS;
+  let models: string[];
+  if (explicit && explicit.trim()) {
+    models = explicit.split(",").map((s) => s.trim()).filter(Boolean);
+  } else {
+    models = [...new Set([GEMINI_MODEL, ...GEMINI_FALLBACKS])];
+  }
+  if (models.length === 0) models = [GEMINI_MODEL];
+
+  const now = new Date();
+  const dayKey = now.getFullYear() * 10000 + now.getMonth() * 100 + now.getDate();
+  const offset = dayKey % models.length;
+  return [...models.slice(offset), ...models.slice(0, offset)];
+}
+
 export function getAgentModel(): string {
-  return getProvider() === "gemini" ? GEMINI_MODEL : AGENT_MODEL;
+  return modelChain()[0];
 }
 
 export function estimateCostUsd(
@@ -63,29 +91,57 @@ function retryDelayMs(err: unknown, fallbackMs: number, capMs: number): number {
   return Math.min(fallbackMs, capMs);
 }
 
+const cooldownUntil = new Map<string, number>();
+
+function pruneCooldowns(now: number): void {
+  for (const k of cooldownUntil.keys()) {
+    if ((cooldownUntil.get(k) ?? 0) <= now) cooldownUntil.delete(k);
+  }
+}
+
 /**
- * Runs a chat completion with a bounded number of attempts. When the provider
- * reports a transient quota/rate-limit (429), it waits for the suggested
- * `retryDelay` and tries again, which smooths bursts on free-tier Gemini
- * keys. Non-quota errors fail immediately.
+ * Runs a chat completion with automatic model fail-over. When a model returns
+ * a quota/rate-limit error (429), it is put into a short cooldown and the next
+ * model in the chain is tried, spreading the load across all Gemini models.
+ * Non-quota errors fail immediately.
  */
-export async function chatComplete(
+export async function completeWithFallback(
   client: OpenAI | null,
-  params: OpenAI.Chat.Completions.ChatCompletionCreateParams,
-  maxAttempts = 2
+  params: OpenAI.Chat.Completions.ChatCompletionCreateParams
 ): Promise<OpenAI.Chat.Completions.ChatCompletion> {
   if (!client) throw new Error("No AI provider configured");
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+
+  const now = Date.now();
+  pruneCooldowns(now);
+  const models = modelChain();
+  let lastErr: unknown = null;
+
+  for (const model of models) {
+    const until = cooldownUntil.get(model);
+    if (until && until > now) continue;
+
     try {
-      return (await client.chat.completions.create(
-        params
-      )) as OpenAI.Chat.Completions.ChatCompletion;
+      const res = (await client.chat.completions.create({
+        ...params,
+        model,
+      })) as OpenAI.Chat.Completions.ChatCompletion;
+      return res;
     } catch (err) {
-      if (attempt + 1 >= maxAttempts || !isQuotaError(err)) throw err;
-      const delay = retryDelayMs(err, 20_000, 35_000);
-      if (delay < 300) throw err;
-      await new Promise((r) => setTimeout(r, delay));
+      lastErr = err;
+      const text = err instanceof Error ? err.message : String(err);
+      const absentModel = /(?:model|modelName)[^]*?not found|not found[^]*?model/i.test(
+        text
+      );
+      if (isQuotaError(err) || (err as { status?: unknown })?.status === 400 || absentModel) {
+        const waitMs = isQuotaError(err)
+          ? retryDelayMs(err, 60_000, 90_000) + 3_000
+          : 0;
+        if (waitMs > 0) cooldownUntil.set(model, now + waitMs);
+        continue;
+      }
+      throw err;
     }
   }
-  throw new Error("chatComplete exhausted attempts");
+
+  throw lastErr ?? new Error("all models attempted and reached quota/rate limit");
 }
