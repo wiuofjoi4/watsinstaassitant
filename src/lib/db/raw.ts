@@ -32,6 +32,9 @@ export function getRawClient(): ReturnType<typeof postgres> {
 }
 
 function makeProxy<T>(): T {
+  const callable = function () {
+    /* replaced by the apply trap below */
+  } as never;
   const target = {
     get(_t: unknown, p: PropertyKey): unknown {
       return Reflect.get(getRawClient() as never, p);
@@ -43,7 +46,7 @@ function makeProxy<T>(): T {
       return p in getRawClient();
     },
   };
-  return new Proxy({}, target) as T;
+  return new Proxy(callable, target) as T;
 }
 
 /** Raw postgres-js client (tagged templates), lazily connected. */
