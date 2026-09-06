@@ -5,8 +5,8 @@ let __client: OpenAI | null = null;
 export type Provider = "gemini" | "openai";
 
 export function getProvider(): Provider | null {
-  if (process.env.GEMINI_API_KEY) return "gemini";
   if (process.env.OPENAI_API_KEY) return "openai";
+  if (process.env.GEMINI_API_KEY) return "gemini";
   return null;
 }
 
