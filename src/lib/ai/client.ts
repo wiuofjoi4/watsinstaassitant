@@ -29,7 +29,7 @@ export const AGENT_MODEL = process.env.AGENT_MODEL ?? "gpt-4o";
 export const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.6-flash";
 export const TRANSCRIBE_MODEL = process.env.TRANSCRIBE_MODEL ?? "whisper-1";
 
-const GEMINI_FALLBACKS = ["gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"];
+const GEMINI_FALLBACKS = ["gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.8-flash"];
 
 /**
  * Ordered model candidates for the current provider. On Gemini, the chain
@@ -80,12 +80,29 @@ async function availableGeminiModels(): Promise<string[]> {
     const names = (data.models ?? [])
       .filter((m) => (m.supportedGenerationMethods ?? []).includes("generateContent"))
       .map((m) => (m.name ?? "").replace(/^models\//, ""))
-      .filter((n) => n.startsWith("gemini-"));
-    const rank = (n: string) => (n.includes("flash") ? 0 : n.includes("lite") ? 1 : 2);
+      .filter(Boolean);
+    const rank = (n: string) => {
+      // Deprioritize image/audio/tts/video/omni/customtools variants — they
+      // either reject plain chat text or are niche. Clean flash/lite first,
+      // then gemma, then pro, then everything else.
+      const niche = /image|tts|audio|video|omni|customtools|robotics|computer-use/.test(
+        n
+      );
+      const clean = !niche;
+      return clean
+        ? n.includes("lite")
+          ? 1
+          : n.includes("pro")
+            ? 3
+            : 0
+        : n.includes("gemma")
+          ? 2
+          : 4;
+    };
     const ranked = [...new Set(names)].sort(
       (a, b) => rank(a) - rank(b) || a.localeCompare(b)
     );
-    __modelsCache = ranked.slice(0, 6);
+    __modelsCache = ranked.slice(0, 12);
   } catch {
     __modelsCache = [];
   }
@@ -93,7 +110,7 @@ async function availableGeminiModels(): Promise<string[]> {
 }
 
 export function getAgentModel(): string {
-  return modelChain()[0];
+  return getProvider() === "openai" ? AGENT_MODEL : GEMINI_MODEL;
 }
 
 export function estimateCostUsd(
@@ -152,12 +169,15 @@ async function tryModels(
       return { result: res, errored: false };
     } catch (err) {
       const text = err instanceof Error ? err.message : String(err);
-      lastErrored = isQuotaError(err) || (err as { status?: unknown })?.status === 400;
-      const absentModel = /(?:model|modelName)[^]*?not found|not found[^]*?model/i.test(text);
-      if (isQuotaError(err) || (err as { status?: unknown })?.status === 400 || absentModel) {
-        const waitMs = isQuotaError(err)
-          ? retryDelayMs(err, 60_000, 90_000) + 3_000
-          : 0;
+      const status = Number((err as { status?: unknown })?.status ?? NaN);
+      const quota = isQuotaError(err);
+      const absent =
+        status === 404 ||
+        status === 400 ||
+        /no longer available|not found|model.?doesn.?t exist|invalid model/i.test(text);
+      lastErrored = quota || absent;
+      if (quota || absent) {
+        const waitMs = quota ? retryDelayMs(err, 60_000, 90_000) + 3_000 : 0;
         if (waitMs > 0) cooldownUntil.set(model, now + waitMs);
         continue;
       }
@@ -197,14 +217,16 @@ export async function completeWithFallback(
     );
   }
 
-  // Static chain exhausted → discover the models this key can actually call.
-  const discovered = (await availableGeminiModels()).filter(
-    (m) => !staticModels.includes(m)
-  );
-  if (discovered.length === 0) {
-    throw new Error("all configured models attempted and reached quota/rate limit");
-  }
-  const second = await tryModels(client, params, discovered);
+  // Static chain exhausted → ask the Gemini API which models this key can
+  // actually call and try those (ranked: flash/lite/gemma first), then any
+  // static-chain models that were not part of the discovery list. Models put
+  // into cooldown moments ago are skipped automatically by tryModels.
+  const discovered = await availableGeminiModels();
+  const combined = [
+    ...discovered,
+    ...staticModels.filter((m) => !discovered.includes(m)),
+  ];
+  const second = await tryModels(client, params, combined);
   if (second.result) return second.result;
   throw new Error("all configured models attempted and reached quota/rate limit");
 }
