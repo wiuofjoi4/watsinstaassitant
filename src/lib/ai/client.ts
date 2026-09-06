@@ -57,6 +57,41 @@ function modelChain(): string[] {
   return [...models.slice(offset), ...models.slice(0, offset)];
 }
 
+let __modelsCache: string[] | null = null;
+
+/**
+ * Lazily asks the Gemini API (via the raw REST endpoint) which models this
+ * project/API-key can actually call, so fail-over discovers real model names
+ * (e.g. new flash/lite models) instead of guessing. Returns [] on any failure.
+ */
+async function availableGeminiModels(): Promise<string[]> {
+  if (__modelsCache) return __modelsCache;
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return [];
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`,
+      { signal: AbortSignal.timeout(10_000) }
+    );
+    if (!res.ok) return [];
+    const data = (await res.json()) as {
+      models?: Array<{ name?: string; supportedGenerationMethods?: string[] }>;
+    };
+    const names = (data.models ?? [])
+      .filter((m) => (m.supportedGenerationMethods ?? []).includes("generateContent"))
+      .map((m) => (m.name ?? "").replace(/^models\//, ""))
+      .filter((n) => n.startsWith("gemini-"));
+    const rank = (n: string) => (n.includes("flash") ? 0 : n.includes("lite") ? 1 : 2);
+    const ranked = [...new Set(names)].sort(
+      (a, b) => rank(a) - rank(b) || a.localeCompare(b)
+    );
+    __modelsCache = ranked.slice(0, 6);
+  } catch {
+    __modelsCache = [];
+  }
+  return __modelsCache ?? [];
+}
+
 export function getAgentModel(): string {
   return modelChain()[0];
 }
@@ -99,39 +134,26 @@ function pruneCooldowns(now: number): void {
   }
 }
 
-/**
- * Runs a chat completion with automatic model fail-over. When a model returns
- * a quota/rate-limit error (429), it is put into a short cooldown and the next
- * model in the chain is tried, spreading the load across all Gemini models.
- * Non-quota errors fail immediately.
- */
-export async function completeWithFallback(
-  client: OpenAI | null,
-  params: OpenAI.Chat.Completions.ChatCompletionCreateParams
-): Promise<OpenAI.Chat.Completions.ChatCompletion> {
-  if (!client) throw new Error("No AI provider configured");
-
+async function tryModels(
+  client: OpenAI,
+  params: OpenAI.Chat.Completions.ChatCompletionCreateParams,
+  models: string[]
+): Promise<{ result: OpenAI.Chat.Completions.ChatCompletion | null; errored: boolean }> {
   const now = Date.now();
-  pruneCooldowns(now);
-  const models = modelChain();
-  let lastErr: unknown = null;
-
+  let lastErrored = false;
   for (const model of models) {
     const until = cooldownUntil.get(model);
     if (until && until > now) continue;
-
     try {
       const res = (await client.chat.completions.create({
         ...params,
         model,
       })) as OpenAI.Chat.Completions.ChatCompletion;
-      return res;
+      return { result: res, errored: false };
     } catch (err) {
-      lastErr = err;
       const text = err instanceof Error ? err.message : String(err);
-      const absentModel = /(?:model|modelName)[^]*?not found|not found[^]*?model/i.test(
-        text
-      );
+      lastErrored = isQuotaError(err) || (err as { status?: unknown })?.status === 400;
+      const absentModel = /(?:model|modelName)[^]*?not found|not found[^]*?model/i.test(text);
       if (isQuotaError(err) || (err as { status?: unknown })?.status === 400 || absentModel) {
         const waitMs = isQuotaError(err)
           ? retryDelayMs(err, 60_000, 90_000) + 3_000
@@ -139,9 +161,50 @@ export async function completeWithFallback(
         if (waitMs > 0) cooldownUntil.set(model, now + waitMs);
         continue;
       }
-      throw err;
+      return { result: null, errored: true };
     }
   }
+  return { result: null, errored: lastErrored };
+}
 
-  throw lastErr ?? new Error("all models attempted and reached quota/rate limit");
+/**
+ * Runs a chat completion with automatic model fail-over. When a model returns
+ * a quota/rate-limit error (429) it is put into a short cooldown and the next
+ * model in the chain is tried. If every configured model is exhausted, the
+ * agent asks the Gemini API which models this project can actually call and
+ * retries with those (observing per-model free-tier quotas). Non-quota errors
+ * fail immediately.
+ */
+export async function completeWithFallback(
+  client: OpenAI | null,
+  params: OpenAI.Chat.Completions.ChatCompletionCreateParams
+): Promise<OpenAI.Chat.Completions.ChatCompletion> {
+  if (!client) throw new Error("No AI provider configured");
+
+  pruneCooldowns(Date.now());
+
+  const provider = getProvider();
+  const staticModels = provider === "openai" ? [AGENT_MODEL] : modelChain();
+
+  const first = await tryModels(client, params, staticModels);
+  if (first.result) return first.result;
+
+  if (provider !== "gemini" || !first.errored) {
+    throw new Error(
+      first.errored
+        ? "all configured models attempted and reached quota/rate limit"
+        : "all configured models failed"
+    );
+  }
+
+  // Static chain exhausted → discover the models this key can actually call.
+  const discovered = (await availableGeminiModels()).filter(
+    (m) => !staticModels.includes(m)
+  );
+  if (discovered.length === 0) {
+    throw new Error("all configured models attempted and reached quota/rate limit");
+  }
+  const second = await tryModels(client, params, discovered);
+  if (second.result) return second.result;
+  throw new Error("all configured models attempted and reached quota/rate limit");
 }

@@ -4,12 +4,14 @@ async function main() {
   const url = process.env.DATABASE_URL!;
   const sql = postgres(url, { ssl: { rejectUnauthorized: false }, prepare: false });
 
-  const rows = await sql`select source, message, stack, created_at
+  const rows = await sql`select source, message, created_at
     from repli.error_logs
     order by created_at desc
-    limit 6`;
-  console.log(JSON.stringify(rows, null, 2));
-
+    limit 4`;
+  for (const r of rows) {
+    const m = String(r.message ?? "").replace(/\s+/g, " ").slice(0, 200);
+    console.log("---", String(r.created_at), "\n", m);
+  }
   await sql.end();
 }
 

@@ -131,29 +131,58 @@ export async function getRestaurantDetail(id: string) {
 }
 
 export async function getRestaurantConversations(restaurantId: string) {
-  const convos = await db
-    .select()
-    .from(conversations)
-    .where(eq(conversations.restaurantId, restaurantId))
-    .orderBy(desc(conversations.lastMessageAt));
+  // Single query instead of N+1: one row per conversation with its last
+  // message (lateral join) and new-order count, sorted by last activity.
+  const rows = await db.execute(sql`
+    select
+      c.id,
+      c.channel,
+      c.remote_jid as "remoteJid",
+      c.customer_name as "customerName",
+      c.status,
+      c.pinned,
+      c.last_message_at as "lastMessageAt",
+      c.created_at as "createdAt",
+      lm.direction as "lm_direction",
+      lm.text as "lm_text",
+      lm.created_at as "lm_createdAt",
+      lm.content_type as "lm_contentType",
+      (select count(*)::int from repli.orders o
+        where o.conversation_id = c.id and o.status = 'new') as "newOrders"
+    from repli.conversations c
+    left join lateral (
+      select m.direction, m.text, m.created_at, m.content_type
+      from repli.messages m
+      where m.conversation_id = c.id
+      order by m.created_at desc
+      limit 1
+    ) lm on true
+    where c.restaurant_id = ${restaurantId}
+    order by c.last_message_at desc
+  `);
 
-  const result = [];
-  for (const c of convos) {
-    const lastMsg = await first(
-      db
-        .select({ direction: messages.direction, text: messages.text, createdAt: messages.createdAt, contentType: messages.contentType })
-        .from(messages)
-        .where(eq(messages.conversationId, c.id))
-        .orderBy(desc(messages.createdAt))
-        .limit(1)
-    );
-    const newOrders = await db
-      .select({ n: sql<number>`count(*)::int` })
-      .from(orders)
-      .where(and(eq(orders.conversationId, c.id), eq(orders.status, "new")));
-    result.push({ ...c, lastMessage: lastMsg ?? null, newOrders: newOrders[0].n });
-  }
-  return result;
+  const raw = rows as Array<Record<string, unknown>>;
+  return raw.map((r) => ({
+    id: String(r.id),
+    restaurantId,
+    channel: String(r.channel),
+    remoteJid: String(r.remoteJid),
+    customerName: (r.customerName as string | null) ?? null,
+    status: String(r.status),
+    pinned: Boolean(r.pinned),
+    lastMessageAt: r.lastMessageAt as Date | null,
+    createdAt: r.createdAt as Date | null,
+    newOrders: Number(r.newOrders) || 0,
+    lastMessage:
+      r.lm_direction ?? r.lm_text ?? r.lm_contentType
+        ? {
+            direction: String(r.lm_direction),
+            text: (r.lm_text as string | null) ?? null,
+            contentType: String(r.lm_contentType),
+            createdAt: r.lm_createdAt as Date | null,
+          }
+        : null,
+  }));
 }
 
 export async function getConversationThread(conversationId: string) {

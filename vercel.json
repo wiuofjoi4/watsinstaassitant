@@ -1,0 +1,12 @@
+{
+  "functions": {
+    "src/app/api/**/route.{ts,tsx}": {
+      "regions": ["sin1"],
+      "maxDuration": 60
+    },
+    "src/app/**/page.{ts,tsx}": {
+      "regions": ["sin1"],
+      "maxDuration": 60
+    }
+  }
+}
