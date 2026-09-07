@@ -3,12 +3,14 @@ import { notFound } from "next/navigation";
 import {
   connectInstagram,
   disconnectInstagram,
-  generateLink,
-  resolveError,
   saveAgentConfig,
-  setOrderStatus,
-  toggleAgent,
 } from "@/app/admin/actions";
+import {
+  AgentToggle,
+  GenerateLinkButton,
+  OrderStatusSelect,
+  ResolveErrorButton,
+} from "@/components/admin/detail-actions";
 import { Badge, Card, CardHeader, EmptyState, Field, Input, Select, Textarea, Toggle } from "@/components/ui";
 import MenuImagesPanel from "@/components/menu-images-panel";
 import {
@@ -89,28 +91,11 @@ export default async function RestaurantDetailPage(
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <form action={toggleAgent}>
-              <input type="hidden" name="restaurantId" value={restaurant.id} />
-              <button
-                type="submit"
-                className={`rounded-lg px-3.5 py-2 text-sm font-medium transition-colors ${
-                  restaurant.agentEnabled
-                    ? "border border-bad/30 bg-bad/15 text-bad hover:bg-bad/25"
-                    : "border border-good/30 bg-good/15 text-good hover:bg-good/25"
-                }`}
-              >
-                {restaurant.agentEnabled ? "⏸ Pause agent" : "▶ Resume agent"}
-              </button>
-            </form>
-            <form action={generateLink}>
-              <input type="hidden" name="restaurantId" value={restaurant.id} />
-              <button
-                type="submit"
-                className="rounded-lg bg-primary px-3.5 py-2 text-sm font-medium text-white transition-colors hover:bg-accent"
-              >
-                {restaurant.linkToken ? "↻ New link" : "Generate QR link"}
-              </button>
-            </form>
+            <AgentToggle restaurantId={restaurant.id} enabled={restaurant.agentEnabled} />
+            <GenerateLinkButton
+              restaurantId={restaurant.id}
+              hasLink={!!restaurant.linkToken}
+            />
           </div>
         </div>
         {linkUrl ? (
@@ -501,22 +486,13 @@ async function OrdersTab({ restaurantId }: { restaurantId: string }) {
                   <td className="max-w-[160px] truncate px-5 py-3 text-xs text-muted">{o.address ?? "—"}</td>
                   <td className="px-5 py-3">
                     <Badge tone={statusTone}>{o.status}</Badge>
-                    <form action={setOrderStatus} className="mt-1.5">
-                      <input type="hidden" name="orderId" value={o.id} />
-                      <input type="hidden" name="restaurantId" value={restaurantId} />
-                      <select
-                        name="status"
-                        onChange={(e) => e.target.form?.requestSubmit()}
-                        defaultValue={o.status}
-                        className="rounded-md border border-line bg-surface px-2 py-1 text-[11px] text-muted focus:outline-none"
-                      >
-                        <option value="new">new</option>
-                        <option value="pinned">pinned</option>
-                        <option value="preparing">preparing</option>
-                        <option value="done">done</option>
-                        <option value="declined">declined</option>
-                      </select>
-                    </form>
+                    <div className="mt-1.5">
+                      <OrderStatusSelect
+                        orderId={o.id}
+                        restaurantId={restaurantId}
+                        status={o.status}
+                      />
+                    </div>
                   </td>
                   <td className="px-5 py-3 text-xs text-muted">{formatDateTime(o.createdAt)}</td>
                 </tr>
@@ -548,13 +524,7 @@ async function ErrorsTab({ restaurantId }: { restaurantId: string }) {
                 {e.source} · {formatDateTime(e.createdAt)}
               </p>
               {!e.resolved ? (
-                <form action={resolveError}>
-                  <input type="hidden" name="errorId" value={e.id} />
-                  <input type="hidden" name="restaurantId" value={restaurantId} />
-                  <button className="rounded-md border border-line px-2.5 py-1 text-[11px] text-muted transition-colors hover:text-soft">
-                    Mark resolved
-                  </button>
-                </form>
+                <ResolveErrorButton errorId={e.id} restaurantId={restaurantId} />
               ) : (
                 <Badge tone="good">resolved</Badge>
               )}
