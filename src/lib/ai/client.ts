@@ -151,6 +151,8 @@ function pruneCooldowns(now: number): void {
   }
 }
 
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function tryModels(
   client: OpenAI,
   params: OpenAI.Chat.Completions.ChatCompletionCreateParams,
@@ -228,5 +230,21 @@ export async function completeWithFallback(
   ];
   const second = await tryModels(client, params, combined);
   if (second.result) return second.result;
+
+  // Last resort: the free tier commonly resets its per-model bucket within a
+  // minute. If the nearest cooldown is coming up soon, wait for it and retry
+  // the already-exhausted chain once more instead of failing immediately.
+  const MAX_WAIT_MS = 45_000;
+  const now = Date.now();
+  const upcoming = [...cooldownUntil.entries()]
+    .map(([, until]) => until)
+    .filter((until) => until > now && until - now <= MAX_WAIT_MS);
+  if (upcoming.length > 0) {
+    const waitMs = Math.max(0, Math.min(...upcoming) - now + 500);
+    if (waitMs > 0) await delay(waitMs);
+    const third = await tryModels(client, params, combined);
+    if (third.result) return third.result;
+  }
+
   throw new Error("all configured models attempted and reached quota/rate limit");
 }

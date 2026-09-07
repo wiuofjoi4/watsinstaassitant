@@ -11,6 +11,14 @@ import {
 import { daysBetween } from "@/lib/utils";
 import { first } from "@/lib/db/query";
 
+/** Normalize a PostgreSQL timestamp (Date or ISO/string) to a Date, or null. */
+function toDate(v: unknown): Date | null {
+  if (v == null) return null;
+  if (v instanceof Date) return v;
+  const t = new Date(String(v));
+  return Number.isNaN(t.getTime()) ? null : t;
+}
+
 /**
  * Short-lived in-process cache for admin list queries so that button reloads
  * (which re-render the whole page) do not hit the remote Supabase on every
@@ -32,13 +40,17 @@ export interface SubscriptionInfo {
 }
 
 export function subscriptionInfo(
-  activatedAt: Date | null | undefined,
+  activatedAt: Date | string | null | undefined,
   subscriptionDays: number
 ): SubscriptionInfo {
   if (!activatedAt) {
     return { daysLeft: 0, totalDays: subscriptionDays, expired: false, expiresSoon: false };
   }
-  const endsAt = new Date(activatedAt.getTime() + subscriptionDays * 24 * 60 * 60 * 1000);
+  const base = activatedAt instanceof Date ? activatedAt : new Date(String(activatedAt));
+  if (Number.isNaN(base.getTime())) {
+    return { daysLeft: 0, totalDays: subscriptionDays, expired: false, expiresSoon: false };
+  }
+  const endsAt = new Date(base.getTime() + subscriptionDays * 24 * 60 * 60 * 1000);
   const daysLeft = Math.max(0, daysBetween(new Date(), endsAt));
   return {
     daysLeft,
@@ -88,12 +100,12 @@ export async function getRestaurantsOverview() {
   `)) as Array<Record<string, unknown>>;
 
   return rows.map((r) => {
-    const activatedAt = r.activatedAt as Date | null;
+    const activatedAt = toDate(r.activatedAt);
     const parsed = subscriptionInfo(activatedAt, Number(r.subscriptionDays));
     return {
       id: String(r.id),
       name: String(r.name ?? ""),
-      createdAt: r.createdAt as Date,
+      createdAt: toDate(r.createdAt),
       agentEnabled: Boolean(r.agentEnabled),
       activatedAt,
       subscriptionDays: Number(r.subscriptionDays) || 30,
@@ -169,16 +181,16 @@ export async function getRestaurantDetail(id: string) {
         temperature: Number(row.c_temperature ?? 0.7),
         askPhone: Boolean(row.c_askPhone),
         askAddress: Boolean(row.c_askAddress),
-        updatedAt: row.c_updatedAt as Date,
+        updatedAt: toDate(row.c_updatedAt),
       }
     : null;
 
   return {
     id: String(row.id),
     name: String(row.name ?? ""),
-    createdAt: row.createdAt as Date,
+    createdAt: toDate(row.createdAt),
     agentEnabled: Boolean(row.agentEnabled),
-    activatedAt: row.activatedAt as Date | null,
+    activatedAt: toDate(row.activatedAt),
     subscriptionDays: Number(row.subscriptionDays) || 30,
     whatsappJid: (row.whatsappJid as string | null) ?? null,
     whatsappLinked: Boolean(row.whatsappLinked),
@@ -237,21 +249,21 @@ export const getRestaurantConversations = cached(
       restaurantId,
       channel: String(r.channel),
       remoteJid: String(r.remoteJid),
-      customerName: (r.customerName as string | null) ?? null,
-      status: String(r.status),
-      pinned: Boolean(r.pinned),
-      lastMessageAt: r.lastMessageAt as Date | null,
-      createdAt: r.createdAt as Date | null,
-      newOrders: Number(r.newOrders) || 0,
-      lastMessage:
-        r.lm_direction ?? r.lm_text ?? r.lm_contentType
-          ? {
-              direction: String(r.lm_direction),
-              text: (r.lm_text as string | null) ?? null,
-              contentType: String(r.lm_contentType),
-              createdAt: r.lm_createdAt as Date | null,
-            }
-          : null,
+customerName: (r.customerName as string | null) ?? null,
+    status: String(r.status),
+    pinned: Boolean(r.pinned),
+    lastMessageAt: toDate(r.lastMessageAt),
+    createdAt: toDate(r.createdAt),
+    newOrders: Number(r.newOrders) || 0,
+    lastMessage:
+      r.lm_direction ?? r.lm_text ?? r.lm_contentType
+        ? {
+            direction: String(r.lm_direction),
+            text: (r.lm_text as string | null) ?? null,
+            contentType: String(r.lm_contentType),
+            createdAt: toDate(r.lm_createdAt),
+          }
+        : null,
     }));
   },
   "restaurant-conversations",
