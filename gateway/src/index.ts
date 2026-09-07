@@ -298,6 +298,9 @@ async function deliver(
         mediaBase64: parsed.mediaBase64,
         mediaMime: parsed.mediaMime,
       }),
+      // Vercel kills the webhook at 60s — never let this call hang past it so
+      // we can log cleanly and the platform's next message doesn't queue up.
+      signal: AbortSignal.timeout(58_000),
     });
     if (!res.ok) {
       logger.error(`webhook message returned ${res.status}`);
