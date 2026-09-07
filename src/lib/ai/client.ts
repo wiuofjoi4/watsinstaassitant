@@ -158,9 +158,11 @@ async function tryModels(
   params: OpenAI.Chat.Completions.ChatCompletionCreateParams,
   models: string[]
 ): Promise<{ result: OpenAI.Chat.Completions.ChatCompletion | null; errored: boolean }> {
-  const now = Date.now();
+  const budgetStart = Date.now();
+  const MAX_BUDGET_MS = 45_000;
   let lastErrored = false;
   for (const model of models) {
+    const now = Date.now();
     const until = cooldownUntil.get(model);
     if (until && until > now) continue;
     try {
@@ -178,10 +180,30 @@ async function tryModels(
         status === 400 ||
         /no longer available|not found|model.?doesn.?t exist|invalid model/i.test(text);
       lastErrored = quota || absent;
-      if (quota || absent) {
-        const waitMs = quota ? retryDelayMs(err, 60_000, 90_000) + 3_000 : 0;
-        if (waitMs > 0) cooldownUntil.set(model, now + waitMs);
-        continue;
+      if (absent) continue;
+      if (quota) {
+        // The free tier bucket is shared by the whole key and refills within a
+        // minute. Cascading to the next model burns the window even faster, so
+        // instead wait for the roll-over window and retry the SAME model.
+        const used = Date.now() - budgetStart;
+        const retryMs = Math.min(
+          retryDelayMs(err, 20_000, 60_000),
+          Math.max(0, MAX_BUDGET_MS - used)
+        );
+        if (retryMs > 0) {
+          cooldownUntil.set(model, Date.now() + retryMs + 1_000);
+          await delay(retryMs);
+          try {
+            const res2 = (await client.chat.completions.create({
+              ...params,
+              model,
+            })) as OpenAI.Chat.Completions.ChatCompletion;
+            return { result: res2, errored: false };
+          } catch (err2) {
+            lastErrored = isQuotaError(err2);
+          }
+        }
+        break;
       }
       return { result: null, errored: true };
     }
@@ -230,21 +252,5 @@ export async function completeWithFallback(
   ];
   const second = await tryModels(client, params, combined);
   if (second.result) return second.result;
-
-  // Last resort: the free tier commonly resets its per-model bucket within a
-  // minute. If the nearest cooldown is coming up soon, wait for it and retry
-  // the already-exhausted chain once more instead of failing immediately.
-  const MAX_WAIT_MS = 45_000;
-  const now = Date.now();
-  const upcoming = [...cooldownUntil.entries()]
-    .map(([, until]) => until)
-    .filter((until) => until > now && until - now <= MAX_WAIT_MS);
-  if (upcoming.length > 0) {
-    const waitMs = Math.max(0, Math.min(...upcoming) - now + 500);
-    if (waitMs > 0) await delay(waitMs);
-    const third = await tryModels(client, params, combined);
-    if (third.result) return third.result;
-  }
-
   throw new Error("all configured models attempted and reached quota/rate limit");
 }
