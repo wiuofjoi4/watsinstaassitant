@@ -10,9 +10,20 @@ import { formatMoney } from "@/lib/utils";
 export const dynamic = "force-dynamic";
 
 export default async function DashboardPage() {
-  const stats = await getDashboardStats();
-  const restaurants = await getRestaurantsOverview();
-  const recentErrors = await getRecentErrors(6);
+  // Fire all three data fetches concurrently. Each one is a round trip to a
+  // remote Supabase; running them serially stacked 3× cross-region RTT on
+  // every dashboard load (cold start or not). Use allSettled so one failing
+  // query degrades gracefully (empty card) instead of a whole-page 500.
+  const [statsRes, restaurantsRes, recentErrorsRes] = await Promise.allSettled([
+    getDashboardStats(),
+    getRestaurantsOverview(),
+    getRecentErrors(6),
+  ]);
+  const stats = statsRes.status === "fulfilled"
+    ? statsRes.value
+    : { restaurantCount: 0, linkedCount: 0, newOrders: 0, monthSpend: 0, openErrors: 0 };
+  const restaurants = restaurantsRes.status === "fulfilled" ? restaurantsRes.value : [];
+  const recentErrors = recentErrorsRes.status === "fulfilled" ? recentErrorsRes.value : [];
 
   const connected = restaurants.filter(
     (r) => r.whatsappStatus === "connected" || r.instagramStatus === "connected"

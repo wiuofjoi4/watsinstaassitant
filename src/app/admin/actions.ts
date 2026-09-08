@@ -5,11 +5,16 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { eq } from "drizzle-orm";
 import { db } from "@/lib/db";
-import { agentConfigs, errorLogs, orders, restaurants } from "@/lib/db/schema";
+import { agentConfigs, errorLogs, orders, restaurants, telegramBots } from "@/lib/db/schema";
 import { buildSystemPrompt } from "@/lib/agent/prompt";
 import { adminCookieMaxAge, adminCookieValue, isAdmin } from "@/lib/auth";
 import { newId, randomToken } from "@/lib/utils";
 import { first } from "@/lib/db/query";
+import {
+  deleteTelegramWebhook,
+  getTelegramBotUsername,
+  setTelegramWebhook,
+} from "@/lib/telegram";
 
 export async function login(_prev: unknown, formData: FormData) {
   const password = String(formData.get("password") ?? "");
@@ -211,6 +216,70 @@ export async function disconnectInstagram(formData: FormData) {
       instagramStatus: "disconnected",
     })
     .where(eq(restaurants.id, restaurantId));
+  revalidatePath(`/admin/restaurants/${restaurantId}`);
+}
+
+export async function saveTelegramBot(formData: FormData) {
+  await guard();
+  const restaurantId = String(formData.get("restaurantId"));
+  const botToken = String(formData.get("botToken") ?? "").trim();
+  if (!botToken) throw new Error("Bot token is required.");
+
+  const info = await getTelegramBotUsername(botToken);
+  if (!info.ok) {
+    throw new Error(
+      `Invalid bot token (${info.description ?? "bad token"}) — create a bot with @BotFather first.`
+    );
+  }
+
+  const existing = await first(
+    db.select().from(telegramBots).where(eq(telegramBots.restaurantId, restaurantId))
+  );
+  const webhookSecret = existing?.webhookSecret || randomToken();
+  const webhook = await setTelegramWebhook(botToken, webhookSecret, restaurantId);
+  if (!webhook.ok) {
+    throw new Error(
+      `Validate token but webhook registration failed: ${
+        webhook.description ?? "unknown error"
+      }. Try again shortly.`
+    );
+  }
+
+  if (existing) {
+    await db
+      .update(telegramBots)
+      .set({
+        botToken,
+        webhookSecret,
+        botUsername: info.username ?? null,
+        enabled: true,
+        updatedAt: new Date(),
+      })
+      .where(eq(telegramBots.restaurantId, restaurantId));
+  } else {
+    await db.insert(telegramBots).values({
+      id: newId(),
+      restaurantId,
+      botToken,
+      webhookSecret,
+      botUsername: info.username ?? null,
+      chatId: null,
+      enabled: true,
+    });
+  }
+  revalidatePath(`/admin/restaurants/${restaurantId}`);
+}
+
+export async function removeTelegramBot(formData: FormData) {
+  await guard();
+  const restaurantId = String(formData.get("restaurantId"));
+  const existing = await first(
+    db.select().from(telegramBots).where(eq(telegramBots.restaurantId, restaurantId))
+  );
+  if (existing?.botToken) {
+    await deleteTelegramWebhook(existing.botToken).catch(() => {});
+  }
+  await db.delete(telegramBots).where(eq(telegramBots.restaurantId, restaurantId));
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 

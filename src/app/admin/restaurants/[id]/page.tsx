@@ -3,7 +3,9 @@ import { notFound } from "next/navigation";
 import {
   connectInstagram,
   disconnectInstagram,
+  removeTelegramBot,
   saveAgentConfig,
+  saveTelegramBot,
 } from "@/app/admin/actions";
 import {
   AgentToggle,
@@ -21,6 +23,7 @@ import {
   getRestaurantUsage,
 } from "@/lib/queries";
 import { formatDateTime, formatMoney } from "@/lib/utils";
+import { getTelegramBotStatus } from "@/lib/telegram";
 
 const TABS = ["overview", "agent", "conversations", "orders", "errors", "usage"] as const;
 
@@ -35,7 +38,10 @@ export default async function RestaurantDetailPage(
     ? String(search.tab)
     : "overview";
 
-  const restaurant = await getRestaurantDetail(id);
+  const restaurant = await getRestaurantDetail(id).catch((err) => {
+    console.error("restaurant detail query failed", err);
+    return null;
+  });
   if (!restaurant) notFound();
 
   const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000";
@@ -47,6 +53,8 @@ export default async function RestaurantDetailPage(
     id: img.id,
     index,
   }));
+
+  const telegramStatus = await getTelegramBotStatus(restaurant.id);
 
   return (
     <div className="mx-auto max-w-6xl space-y-6">
@@ -174,6 +182,79 @@ export default async function RestaurantDetailPage(
                 className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent"
               >
                 Save Instagram connection
+              </button>
+            </div>
+          </form>
+        )}
+      </Card>
+
+      {/* Telegram orders bot */}
+      <Card className="p-5">
+        <div className="mb-4 flex items-center justify-between">
+          <div>
+            <p className="text-sm font-medium text-soft">Telegram orders bot</p>
+            <p className="mt-0.5 text-xs text-muted">
+              Create a bot with @BotFather and paste its token. Every confirmed order is
+              sent to it with the date, order and address — and any user who opens the bot
+              and sends a message can read the confirmed orders.
+            </p>
+          </div>
+          <StatusChip
+            label="Status"
+            ok={!!telegramStatus?.enabled}
+            okText="Connected"
+            badText="Not connected"
+            badTone="neutral"
+          />
+        </div>
+
+        {telegramStatus?.enabled ? (
+          <div className="space-y-3">
+            <div className="grid gap-3 sm:grid-cols-2">
+              <div className="rounded-lg border border-line bg-surface/60 p-3">
+                <p className="text-[11px] uppercase tracking-wider text-muted">Bot</p>
+                <p className="mt-0.5 font-mono text-xs text-soft">
+                  @{telegramStatus.botUsername ?? "—"}
+                </p>
+              </div>
+              <div className="rounded-lg border border-line bg-surface/60 p-3">
+                <p className="text-[11px] uppercase tracking-wider text-muted">Last chat that opened the bot</p>
+                <p className="mt-0.5 break-all font-mono text-xs text-soft">
+                  {telegramStatus.chatId ?? "Nobody yet"}
+                </p>
+              </div>
+            </div>
+            <p className="text-xs text-muted">
+              Token stored (redacted). New confirmed orders are pushed to the last chat
+              that messaged the bot; anyone can message the bot to see the orders list.
+            </p>
+            <form action={removeTelegramBot}>
+              <input type="hidden" name="restaurantId" value={restaurant.id} />
+              <button
+                type="submit"
+                className="rounded-lg border border-bad/30 bg-bad/15 px-3.5 py-2 text-sm font-medium text-bad transition-colors hover:bg-bad/25"
+              >
+                Disconnect Telegram bot
+              </button>
+            </form>
+          </div>
+        ) : (
+          <form action={saveTelegramBot} className="space-y-4">
+            <input type="hidden" name="restaurantId" value={restaurant.id} />
+            <div className="grid gap-4 md:grid-cols-3">
+              <Field
+                label="Bot token"
+                hint="From @BotFather. Send any message to the bot after saving."
+              >
+                <Input name="botToken" type="password" placeholder="123456:ABC-DEF..." required />
+              </Field>
+            </div>
+            <div className="flex justify-end">
+              <button
+                type="submit"
+                className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-accent"
+              >
+                Save Telegram bot
               </button>
             </div>
           </form>
@@ -388,7 +469,25 @@ function AgentTab({ restaurant }: { restaurant: NonNullable<Awaited<ReturnType<t
 }
 
 async function ConversationsTab({ restaurantId }: { restaurantId: string }) {
-  const convos = await getRestaurantConversations(restaurantId);
+  // The conversations query (lateral join over messages) is the heaviest one.
+  // If it fails or times out on the platform, show a graceful card instead of
+  // killing the whole page with a 500.
+  let convos: Awaited<ReturnType<typeof getRestaurantConversations>> | null = null;
+  try {
+    convos = await getRestaurantConversations(restaurantId);
+  } catch (err) {
+    console.error("conversations query failed", err);
+  }
+  if (convos === null) {
+    return (
+      <Card>
+        <EmptyState
+          title="Couldn't load conversations"
+          description="The conversations query failed. Reload the page to try again."
+        />
+      </Card>
+    );
+  }
   if (convos.length === 0) {
     return (
       <Card>
@@ -435,7 +534,22 @@ async function ConversationsTab({ restaurantId }: { restaurantId: string }) {
 }
 
 async function OrdersTab({ restaurantId }: { restaurantId: string }) {
-  const orders = await getRestaurantOrders(restaurantId);
+  let orders: Awaited<ReturnType<typeof getRestaurantOrders>> | null = null;
+  try {
+    orders = await getRestaurantOrders(restaurantId);
+  } catch (err) {
+    console.error("orders query failed", err);
+  }
+  if (orders === null) {
+    return (
+      <Card>
+        <EmptyState
+          title="Couldn't load orders"
+          description="The orders query failed. Reload the page to try again."
+        />
+      </Card>
+    );
+  }
   if (orders.length === 0) {
     return (
       <Card>
@@ -506,7 +620,22 @@ async function OrdersTab({ restaurantId }: { restaurantId: string }) {
 }
 
 async function ErrorsTab({ restaurantId }: { restaurantId: string }) {
-  const errors = await getRestaurantErrors(restaurantId);
+  let errors: Awaited<ReturnType<typeof getRestaurantErrors>> | null = null;
+  try {
+    errors = await getRestaurantErrors(restaurantId);
+  } catch (err) {
+    console.error("errors query failed", err);
+  }
+  if (errors === null) {
+    return (
+      <Card>
+        <EmptyState
+          title="Couldn't load errors"
+          description="The errors query failed. Reload the page to try again."
+        />
+      </Card>
+    );
+  }
   if (errors.length === 0) {
     return (
       <Card>
@@ -539,7 +668,23 @@ async function ErrorsTab({ restaurantId }: { restaurantId: string }) {
 }
 
 async function UsageTab({ restaurantId }: { restaurantId: string }) {
-  const { logs, totals } = await getRestaurantUsage(restaurantId);
+  let usage: Awaited<ReturnType<typeof getRestaurantUsage>> | null = null;
+  try {
+    usage = await getRestaurantUsage(restaurantId);
+  } catch (err) {
+    console.error("usage query failed", err);
+  }
+  if (usage === null) {
+    return (
+      <Card>
+        <EmptyState
+          title="Couldn't load usage"
+          description="The usage query failed. Reload the page to try again."
+        />
+      </Card>
+    );
+  }
+  const { logs, totals } = usage;
   return (
     <div className="space-y-4">
       <div className="grid gap-4 sm:grid-cols-3">

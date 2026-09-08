@@ -3,28 +3,24 @@ import postgres from "postgres";
 async function main() {
   const url = process.env.DATABASE_URL!;
   const sql = postgres(url, { ssl: { rejectUnauthorized: false }, prepare: false });
-  const cols = await sql`select column_name from information_schema.columns where table_schema='repli' and table_name='error_logs' order by ordinal_position`;
-  console.log("columns:", cols.map((c) => String((c as { column_name: unknown }).column_name)).join(", "));
-  const logs = await sql`select * from repli.error_logs order by created_at desc limit 12`;
-  for (const l of logs as Array<Record<string, unknown>>) {
-    console.log("---");
-    console.log("at:", l.created_at);
-    console.log("src:", l.source, "| lvl:", l.level ?? l.severity, "| code:", l.code);
-    console.log("msg:", String(l.message).slice(0, 500));
+
+  const e = await sql`select id, created_at, message from repli.error_logs order by created_at desc limit 6`;
+  for (const r of e as Array<Record<string, unknown>>) {
+    console.log("---", String(r.created_at), "| id:", String(r.id));
+    console.log(String(r.message).slice(0, 180));
   }
-  const convs = await sql`
-    select c.whatsapp_jid, c.direction, c.text, c.created_at
-    from repli.conversations c
-    where c.whatsapp_jid is not null
-    order by c.created_at desc
-    limit 5
+
+  const m = await sql`
+    select created_at, direction, text from repli.messages
+    where created_at >= '2026-09-07T00:00:00Z'
+    order by created_at desc limit 6
   `;
-  console.log("\n=== recent conversations ===");
-  for (const l of convs as Array<Record<string, unknown>>) {
-    console.log("---");
-    console.log("at:", l.created_at, "| dir:", l.direction);
-    console.log("text:", String(l.text).slice(0, 300));
+  console.log("\n=== latest messages today ===");
+  for (const r of m as Array<Record<string, unknown>>) {
+    console.log("---", String(r.created_at), "| dir:", String(r.direction));
+    console.log(String(r.text ?? "").slice(0, 120));
   }
+
   await sql.end();
 }
 main().catch((e) => { console.error(e); process.exit(1); });

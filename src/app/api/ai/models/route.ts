@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import {
   completeWithFallback,
   getAgentModel,
-  getOpenAI,
   getProvider,
 } from "@/lib/ai/client";
 
@@ -30,8 +29,7 @@ export async function GET(req: Request) {
   // see exactly which model answers today (validates the discovery path).
   if (new URL(req.url).searchParams.get("ping") === "1") {
     try {
-      const client = getOpenAI();
-      const res = await completeWithFallback(client, {
+      const res = await completeWithFallback({
         model: getAgentModel(),
         messages: [{ role: "user", content: "Reply with the single word: pong" }],
         max_tokens: 8,
@@ -39,11 +37,17 @@ export async function GET(req: Request) {
       return NextResponse.json({
         provider,
         answeredModel: res.model,
+        keyLabel: (res as unknown as { keyLabel?: string }).keyLabel ?? null,
         content: res.choices?.[0]?.message?.content ?? null,
       });
     } catch (err) {
       return NextResponse.json(
-        { provider, error: String(err instanceof Error ? err.message : err) },
+        {
+          provider,
+          error: String(err instanceof Error ? err.message : err),
+          attempts: (err as { attempts?: Array<{ model: string; status: number; msg: string }> })
+            ?.attempts ?? [],
+        },
         { status: 502 }
       );
     }
