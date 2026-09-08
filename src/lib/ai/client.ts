@@ -414,16 +414,17 @@ async function tryModels(
 /**
  * Runs a chat completion with automatic model fail-over and key rotation.
  *
- * Strategy (in order):
- *  1. Gemini keys × static model chain (daily rotation)
- *  2. Gemini discovered models (via live API) × all Gemini keys
- *  3. OpenAI key(s) × AGENT_MODEL
+ * Strategy (in order, per PROVIDER_PRIORITY):
+ *  1. OpenRouter keys × OR_MODEL
+ *  2. Gemini keys × static model chain (daily rotation)
+ *  3. Gemini discovered models (via live API) × all Gemini keys
+ *  4. OpenAI key(s) × AGENT_MODEL
  *
  * Within each provider, each model is retried once with back-off on 429.
- * After exhausting Gemini quota, falls through to OpenAI. The whole chain is
- * bounded by `budgetMs` (time spent retrying/waiting) and each individual API
- * call by `timeoutMs` — a slow quota wait must never eat the webhook budget or
- * the customer would never get a reply.
+ * After exhausting a provider, falls through to the next one in priority.
+ * The whole chain is bounded by `budgetMs` (time spent retrying/waiting) and
+ * each individual API call by `timeoutMs` — a slow quota wait must never eat
+ * the webhook budget or the customer would never get a reply.
  */
 export interface CompleteOptions {
   budgetMs?: number;
@@ -455,7 +456,24 @@ export async function completeWithFallback(
     : [];
   const attemptLogs: AttemptLog[] = [];
 
-  // --- Phase 1: Gemini static chain ---
+  // --- Phase 1: OpenRouter (top of PROVIDER_PRIORITY) ---
+  if (providers.includes("openrouter")) {
+    const openrouterFirst = await tryModels(
+      params,
+      [OR_MODEL],
+      ["openrouter"],
+      budgetEndMs,
+      timeoutMs
+    );
+    attemptLogs.push(...(openrouterFirst.attempts ?? []));
+    if (openrouterFirst.result) {
+      return Object.assign(openrouterFirst.result, {
+        keyLabel: openrouterFirst.keyUsed ?? undefined,
+      });
+    }
+  }
+
+  // --- Phase 2: Gemini static chain ---
   if (geminiModels.length > 0) {
     const first = await tryModels(
       params,
@@ -469,7 +487,7 @@ export async function completeWithFallback(
       return Object.assign(first.result, { keyLabel: first.keyUsed ?? undefined });
     }
 
-    // --- Phase 2: Gemini auto-discovered models ---
+    // --- Phase 3: Gemini auto-discovered models ---
     // Runs whenever phase 1 produced nothing — including "all static model
     // names invalid/absent" (404). Older builds only ran discovery when the
     // chain *errored*, so stale/renamed default models hid the real ones
@@ -492,7 +510,7 @@ export async function completeWithFallback(
     }
   }
 
-  // --- Phase 3: OpenAI ---
+  // --- Phase 4: OpenAI ---
   if (providers.includes("openai")) {
     const third = await tryModels(
       params,
