@@ -450,9 +450,36 @@ async function buildMessages(
 // Cheap heuristic to skip the extractOrder LLM call when the message clearly
 // isn't an order — halves quota burn on casual chat (free-tier Gemini quota
 // exhaustion is the #1 cause of the "try again" apology, so every saved call
-// keeps the quota alive for real replies).
-const ORDER_HINT =
-  /[أا]طل[بب]|وج[بب][ةه]|عشا|غدا|فط[وو]|[أا]كل|شاورما|برجر|باستا|بيزا|كبس|مندي|عدس|سل[ةط]|مشروب|عصير|كولا|ذبيح|منيو[ق]?|توصيل|عنوان|نمر[ية]|رقم/;
+// keeps the quota alive for real replies). The old ORDER_HINT matched any
+// food/menu word, so price questions like "كم سعر الشاورما؟" fired a full
+// extractOrder LLM call every turn. The gate below only fires on an explicit
+// order intent (an ask/request verb), keeping browsing turns at ONE LLM call.
+const ORDER_INTENT =
+  /[أا]?طل[بب]|[أا]ريد|ابريد|ابي|ابغ[يى]|ابه|ودي|بگطع|گطعلي|عطني|اعطيني|آخذ|اخذ|بطلب|\b(i want|i'?d like|want|order|give me|get me|i'?ll take)\b/i;
+
+// A bare confirmation ("تمام", "نعم", "موافق"...) is not an order by itself,
+// but when it closes a chat that already carries order context (a product or
+// a phone number in the recent exchange) the Telegram push must still fire.
+const ORDER_CONFIRM = /تمام|نعم|اكيد|أكيد|موافق|زين|هيه|yes|\bok\b/i;
+
+const ORDER_CONTEXT = /شاورما|برجر|باستا|بيزا|كبس|مندي|عدس|سل[ةط]|كولا|عصير|مشروب|فط[وو]|عشا|بيض|لحم|دجاج|مشاوي|صفيحة|كباب|شيش|\d{7,15}/;
+
+async function hasOrderIntent(conversationId: string, text: string): Promise<boolean> {
+  if (ORDER_INTENT.test(text)) return true;
+  if (!ORDER_CONFIRM.test(text)) return false;
+  const recent = await db
+    .select({ text: messages.text })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.conversationId, conversationId),
+        sql`${messages.text} is not null`
+      )
+    )
+    .orderBy(desc(messages.createdAt))
+    .limit(10);
+  return recent.some((m) => m.text && ORDER_CONTEXT.test(m.text));
+}
 
 export interface RunResult {
   replyText: string;
@@ -476,7 +503,7 @@ export interface RunResult {
  * Returns null when nothing parseable exists. */
 function parseJsonSafe(raw: string): unknown | null {
   if (!raw || !raw.trim()) return null;
-  let s = raw.trim().replace(/^```[a-z]*\s*/i, "").replace(/\s*```/i, "").trim();
+  const s = raw.trim().replace(/^```[a-z]*\s*/i, "").replace(/\s*```/i, "").trim();
   try {
     return JSON.parse(s);
   } catch {
@@ -796,7 +823,7 @@ async function runIncomingMessage(
     // out an order, the human is handling the chat, OR the text is a casual
     // greeting that clearly holds no order (saves quota on the free tier).
     const orderHint =
-      ORDER_HINT.test(effectiveText) ||
+      (await hasOrderIntent(conversation.id, effectiveText)) ||
       input.contentType === "voice" ||
       input.contentType === "image";
     const canExtract =
