@@ -32,7 +32,7 @@ export async function GET(req: Request) {
       const res = await completeWithFallback({
         model: getAgentModel(),
         messages: [{ role: "user", content: "Reply with the single word: pong" }],
-        max_tokens: 8,
+        max_tokens: 200,
       });
       return NextResponse.json({
         provider,
