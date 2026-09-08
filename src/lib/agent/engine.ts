@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { after } from "next/server";
 import { and, desc, eq, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
@@ -907,10 +908,15 @@ async function runIncomingMessage(
     }
     // Push the confirmed order (date + order + address) to the restaurant's
     // Telegram bot, and log it so any user who messages the bot can read it.
-    await withDeadline(
-      notifyTelegramOrder(input.restaurantId, order),
-      Math.min(5_000, Math.max(0, deadline - Date.now()))
-    ).catch(() => {});
+    // Runs under `after()` (post-response) so it gets the route's full 60s
+    // maxDuration instead of the shrinking handler deadline — a slow/cold DB
+    // insert previously left deliveries stranded with no Telegram message and
+    // no log. Failures are logged (see notifyTelegramOrder) and re-logged here.
+    after(() => {
+      withDeadline(notifyTelegramOrder(input.restaurantId, order), 20_000).catch((err) =>
+        insertErrorBestEffort(input.restaurantId, "telegram", "notifyTelegramOrder failed", err)
+      );
+    });
   }
 
   // Structured outcome log — lets ops diagnose intermittent failures from logs

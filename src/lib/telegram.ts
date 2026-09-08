@@ -2,6 +2,7 @@ import { desc, eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { first } from "@/lib/db/query";
 import {
+  errorLogs,
   restaurants,
   telegramBots,
   telegramOrderDeliveries,
@@ -208,19 +209,37 @@ export async function getTelegramBotStatus(
 /**
  * Called when the agent confirms an order (items + phone + address known).
  * Best-effort and bounded: it must NEVER break or slow the customer's turn —
- * the reply already succeeded before this runs.
+ * the reply already succeeded before this runs. Every failure is logged so a
+ * missing delivery is diagnosable instead of silently swallowed.
  */
 export async function notifyTelegramOrder(
   restaurantId: string,
   order: AgentOrderResult
 ): Promise<void> {
+  async function logError(source: string, message: string, err?: unknown) {
+    try {
+      await db.insert(errorLogs).values({
+        id: newId(),
+        restaurantId,
+        source,
+        message: `${source}: ${message}`,
+        stack: err instanceof Error ? (err.stack ?? null) : null,
+      });
+    } catch {
+      // ignore — logging must never throw out of the notify path
+    }
+  }
+
   const config = await first(
     db
       .select()
       .from(telegramBots)
       .where(eq(telegramBots.restaurantId, restaurantId))
   ).catch(() => null);
-  if (!config || !config.botToken || !config.enabled) return;
+  if (!config || !config.botToken || !config.enabled) {
+    await logError("telegram", `no enabled telegram config for ${restaurantId}`);
+    return;
+  }
 
   const restaurant = await first(
     db
@@ -234,23 +253,34 @@ export async function notifyTelegramOrder(
   const text = composeOrderText(restaurantName, requestedAt, order);
 
   // Durable log — powers the public "any user can view" replies from the bot.
-  await db
-    .insert(telegramOrderDeliveries)
-    .values({
-      id: newId(),
-      restaurantId,
-      requestedAt,
-      customerName: order.customerName ?? null,
-      phone: order.phone ?? null,
-      address: order.address ?? null,
-      itemsJson: JSON.stringify(Array.isArray(order.items) ? order.items : []),
-      total: Number(order.total) > 0 ? Number(order.total) : null,
-      text,
-    })
-    .catch(() => {});
+  try {
+    await db
+      .insert(telegramOrderDeliveries)
+      .values({
+        id: newId(),
+        restaurantId,
+        requestedAt,
+        customerName: order.customerName ?? null,
+        phone: order.phone ?? null,
+        address: order.address ?? null,
+        itemsJson: JSON.stringify(Array.isArray(order.items) ? order.items : []),
+        total: Number(order.total) > 0 ? Number(order.total) : null,
+        text,
+      });
+  } catch (err) {
+    await logError("telegram", "order delivery insert failed", err);
+  }
 
   if (config.chatId) {
-    await sendTelegramMessage(config.botToken, config.chatId, text, 6000);
+    const sent = await sendTelegramMessage(config.botToken, config.chatId, text, 10000).catch(
+      async (err) => {
+        await logError("telegram", "order message send threw", err);
+        return false;
+      }
+    );
+    if (!sent) {
+      await logError("telegram", "order message send returned false");
+    }
   }
 }
 
