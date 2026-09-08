@@ -20,11 +20,16 @@ export default async function ConversationPage(
   );
   if (!conversation || conversation.restaurantId !== id) notFound();
 
-  const thread = (await getConversationThread(conversationId)).reverse();
+  // Guard each read so a slow/failing query shows a partial thread instead of
+  // a whole-page 500 (this is the heaviest page after the conversations tab).
+  const thread = await getConversationThread(conversationId)
+    .then((t) => t.reverse())
+    .catch(() => []);
   const convOrders = await db
     .select()
     .from(orders)
-    .where(eq(orders.conversationId, conversationId));
+    .where(eq(orders.conversationId, conversationId))
+    .catch(() => []);
 
   return (
     <div className="mx-auto max-w-3xl space-y-6">

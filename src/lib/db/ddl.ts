@@ -148,4 +148,14 @@ ALTER TABLE "repli"."restaurants" ADD COLUMN IF NOT EXISTS "auto_menu_whatsapp" 
 ALTER TABLE "repli"."restaurants" ADD COLUMN IF NOT EXISTS "auto_menu_instagram" boolean DEFAULT false NOT NULL;
 --> statement-breakpoint
 CREATE INDEX "usage_logs_restaurant_idx" ON "repli"."usage_logs" USING btree ("restaurant_id","created_at");
+--> statement-breakpoint
+ALTER TABLE "repli"."usage_logs" ADD COLUMN IF NOT EXISTS "key_label" text DEFAULT '' NOT NULL;
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "messages_conversation_created_idx" ON "repli"."messages" USING btree ("conversation_id","created_at" DESC);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "orders_restaurant_status_idx" ON "repli"."orders" USING btree ("restaurant_id","status");
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "usage_logs_created_idx" ON "repli"."usage_logs" USING btree ("created_at");
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "error_logs_resolved_idx" ON "repli"."error_logs" USING btree ("resolved","created_at" DESC);
 `;

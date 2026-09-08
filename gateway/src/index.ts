@@ -210,14 +210,25 @@ async function startSession(restaurantId: string): Promise<void> {
 
   socket.ev.on("messages.upsert", async ({ messages: upserts, type }) => {
     if (type !== "notify") return;
+    // Per-message isolation: one failed message must not abort delivery of the
+    // rest of the batch (a throw here would silently skip every later message).
     for (const m of upserts) {
       if (m.key.fromMe) continue;
       const remoteJid = m.key.remoteJid;
       if (!remoteJid) continue;
 
-      const content = await handleMessage(session, m);
-      if (content) {
-        await deliver(restaurantId, remoteJid, content);
+      try {
+        const content = await handleMessage(session, m);
+        if (content) {
+          await deliver(restaurantId, remoteJid, content);
+        }
+      } catch (err) {
+        logger.error(
+          `messages.upsert handler threw for ${restaurantId}/${remoteJid}: ${String(err)}`
+        );
+        // Guarantee the customer still hears something even on an unexpected
+        // exception in parsing/delivery for this message.
+        await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
       }
     }
   });
@@ -228,6 +239,39 @@ interface ParsedMessage {
   text?: string | null;
   mediaBase64?: string;
   mediaMime?: string;
+}
+
+// Graceful fallback replies — Iraqi Arabic dialect, matching the platform's
+// tone. The CUSTOMER never sees a raw error / stack trace: on any failure we
+// send one of these instead of silence.
+const FALLBACK_REPLY_GENERIC =
+  "عذراً صار تعطل بسيط بالخادم، كرر رسالتك بعد دقيقة 🙏";
+const FALLBACK_REPLY_MEDIA_TOO_LARGE =
+  "عذراً، الصورة كبيرة هواية وما قدرت أقراها. أرسل صورة أصغر أو اكتب الوصف بالكلام 🙏";
+
+// Cap this under Vercel's 60s function budget so the abort fires BEFORE the
+// platform lambda is killed. If we wait too long, the platform gets nothing
+// and neither placeholder NOR reply can be sent.
+const PLATFORM_TIMEOUT_MS = 55_000;
+
+// Guard against multi-MB base64 payloads blowing up the webhook request /
+// function memory. WhatsApp images routinely exceed 1MB base64.
+const MAX_MEDIA_BASE64_LENGTH = 4_000_000; // ~3MB binary
+
+/** Best-effort: send a fallback text to the customer if the session is up. */
+async function sendFallback(
+  restaurantId: string,
+  remoteJid: string,
+  text: string
+): Promise<void> {
+  const session = sessions.get(restaurantId);
+  if (!session?.connected) return;
+  try {
+    await session.socket.sendMessage(remoteJid, { text });
+    logger.info(`fallback sent to ${remoteJid} for ${restaurantId}: ${text.slice(0, 40)}`);
+  } catch (err) {
+    logger.error(`fallback send failed for ${restaurantId} ${remoteJid}: ${String(err)}`);
+  }
 }
 
 async function handleMessage(
@@ -286,6 +330,31 @@ async function deliver(
   parsed: ParsedMessage
 ): Promise<boolean> {
   try {
+    // Over-sized media would blow the webhook request / function memory and
+    // produce a silent failure. Reject it up-front with a graceful message.
+    if (
+      parsed.mediaBase64 &&
+      parsed.mediaBase64.length > MAX_MEDIA_BASE64_LENGTH
+    ) {
+      logger.warn(
+        `media too large (${parsed.mediaBase64.length} base64 chars) for ${restaurantId}/${remoteJid}`
+      );
+      await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_MEDIA_TOO_LARGE);
+      return false;
+    }
+
+    // Show a typing indicator right away so the customer knows the bot is
+    // working — this is a cheap, near-instant signal while the platform LLM
+    // call runs.
+    try {
+      const session = sessions.get(restaurantId);
+      if (session?.connected) {
+        await session.socket.sendPresenceUpdate("composing", remoteJid);
+      }
+    } catch {
+      // Typing indicator is best-effort — never fail the turn over it.
+    }
+
     const res = await fetch(`${PLATFORM_URL}/api/webhooks/message`, {
       method: "POST",
       headers: headers(),
@@ -300,43 +369,85 @@ async function deliver(
       }),
       // Vercel kills the webhook at 60s — never let this call hang past it so
       // we can log cleanly and the platform's next message doesn't queue up.
-      signal: AbortSignal.timeout(58_000),
+      // We MUST abort and send a fallback before the lambda is killed, or the
+      // customer gets silence (root cause of silent failures).
+      signal: AbortSignal.timeout(PLATFORM_TIMEOUT_MS),
     });
     if (!res.ok) {
-      logger.error(`webhook message returned ${res.status}`);
+      logger.error(`webhook message returned ${res.status} for ${restaurantId}`);
+      await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
       return false;
     }
     const data = (await res.json()) as {
       reply?: { text?: string } | null;
       images?: Array<{ base64?: string; mime?: string }>;
+      silent?: boolean;
     };
+    // A "silent" turn (human currently handling this chat in the dashboard)
+    // deliberely requires NO bot reply — do not auto-fallback over the human.
+    if (data.silent === true) return false;
     const replyText = data.reply?.text;
-    if ((!replyText || replyText.trim().length === 0) && !data.images?.length) {
+    const session = sessions.get(restaurantId);
+    if (!session?.connected) {
+      // Session dropped (WhatsApp disconnect) — nothing to send to. Still log.
+      logger.warn(
+        `deliver: no connected session for ${restaurantId} (${remoteJid}) ${Date.now()}`
+      );
       return false;
     }
-
-    const session = sessions.get(restaurantId);
-    if (!session) return false;
 
     // Human-like: small random delay before replying
     const delay = 800 + Math.floor(Math.random() * 1800);
     await new Promise((r) => setTimeout(r, delay));
 
+    // Send images one at a time; a failure on one image must NOT prevent the
+    // text (the main reply) from going out.
+    let imagesSent = false;
     for (const img of data.images ?? []) {
       if (!img.base64) continue;
       const buf = Buffer.from(img.base64, "base64");
       if (buf.length === 0) continue;
-      await session.socket.sendMessage(remoteJid, {
-        image: buf,
-        mimetype: img.mime ?? "image/jpeg",
-      });
+      try {
+        await session.socket.sendMessage(remoteJid, {
+          image: buf,
+          mimetype: img.mime ?? "image/jpeg",
+        });
+        imagesSent = true;
+      } catch (err) {
+        logger.error(
+          `deliver: image send failed for ${restaurantId}/${remoteJid}: ${String(err)}`
+        );
+      }
     }
-    if (replyText) {
-      await session.socket.sendMessage(remoteJid, { text: replyText });
+
+    if (replyText && replyText.trim().length > 0) {
+      try {
+        await session.socket.sendMessage(remoteJid, { text: replyText });
+        return true;
+      } catch (err) {
+        logger.error(
+          `deliver: reply send failed for ${restaurantId}/${remoteJid}: ${String(err)}`
+        );
+        // The text send itself failed — make sure the customer still gets a
+        // graceful notice rather than silence.
+        await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
+        return false;
+      }
+    }
+
+    if (!imagesSent) {
+      // Platform said OK but produced neither text nor images (e.g. restaurant
+      // not found / agent disabled). We promised to always reply — send the
+      // graceful fallback instead of the silent black hole.
+      await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
+      return false;
     }
     return true;
   } catch (err) {
-    logger.error(`deliver failed: ${String(err)}`);
+    logger.error(
+      `deliver failed for ${restaurantId}/${remoteJid}: ${String(err)}`
+    );
+    await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
     return false;
   }
 }

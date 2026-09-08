@@ -23,15 +23,20 @@ export function formatMoney(centsOrUsd: number, asUsd = false): string {
   return `$${(centsOrUsd / 100).toFixed(2)}`;
 }
 
-export function formatDateTime(ts: Date | null | undefined): string {
+export function formatDateTime(ts: Date | null | undefined | string): string {
   if (!ts) return "—";
+  const time = ts instanceof Date ? ts.getTime() : new Date(String(ts)).getTime();
+  // A bad timestamp from the DB (e.g. a text column holding a non-date) must
+  // never 500 the whole page — Intl.DateTimeFormat.format throws
+  // "RangeError: Invalid time value" on invalid Dates.
+  if (!Number.isFinite(time)) return "—";
   return new Intl.DateTimeFormat("en-GB", {
     day: "2-digit",
     month: "short",
     year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
-  }).format(ts);
+  }).format(new Date(time));
 }
 
 export function daysBetween(from: Date, to: Date): number {

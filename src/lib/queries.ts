@@ -60,156 +60,168 @@ export function subscriptionInfo(
   };
 }
 
-export async function getDashboardStats() {
-  const rows = (await db.execute(sql`
-    select
-      (select count(*)::int from repli.restaurants) as "restaurantCount",
-      (select count(*)::int from repli.restaurants where whatsapp_linked = true or instagram_linked = true) as "linkedCount",
-      (select count(*)::int from repli.orders where status = 'new') as "newOrders",
-      (select coalesce(sum(cost_usd), 0)::float8 from repli.usage_logs where created_at >= date_trunc('month', now())) as "monthSpend",
-      (select count(*)::int from repli.error_logs where resolved = false) as "openErrors"
-  `)) as Array<Record<string, unknown>>;
-  const s = rows[0];
-  return {
-    restaurantCount: Number(s.restaurantCount) || 0,
-    linkedCount: Number(s.linkedCount) || 0,
-    newOrders: Number(s.newOrders) || 0,
-    monthSpend: Number(s.monthSpend) || 0,
-    openErrors: Number(s.openErrors) || 0,
-  };
-}
-
-export async function getRestaurantsOverview() {
-  // One query with correlated subselects instead of 1 + 4×N round trips.
-  const rows = (await db.execute(sql`
-    select
-      r.id, r.name, r.created_at as "createdAt",
-      r.agent_enabled as "agentEnabled",
-      r.activated_at as "activatedAt",
-      r.subscription_days as "subscriptionDays",
-      r.whatsapp_status as "whatsappStatus",
-      r.instagram_status as "instagramStatus",
-      r.whatsapp_linked as "whatsappLinked",
-      r.instagram_linked as "instagramLinked",
-      (select count(*)::int from repli.orders o where o.restaurant_id = r.id and o.status = 'new') as "newOrders",
-      (select count(*)::int from repli.conversations c where c.restaurant_id = r.id) as "conversationCount",
-      (select count(*)::int from repli.error_logs e where e.restaurant_id = r.id and e.resolved = false) as "openErrors",
-      (select coalesce(sum(u.cost_usd), 0)::float8 from repli.usage_logs u where u.restaurant_id = r.id) as "totalSpend"
-    from repli.restaurants r
-    order by r.created_at desc
-  `)) as Array<Record<string, unknown>>;
-
-  return rows.map((r) => {
-    const activatedAt = toDate(r.activatedAt);
-    const parsed = subscriptionInfo(activatedAt, Number(r.subscriptionDays));
+export const getDashboardStats = cached(
+  async () => {
+    const rows = (await db.execute(sql`
+      select
+        (select count(*)::int from repli.restaurants) as "restaurantCount",
+        (select count(*)::int from repli.restaurants where whatsapp_linked = true or instagram_linked = true) as "linkedCount",
+        (select count(*)::int from repli.orders where status = 'new') as "newOrders",
+        (select coalesce(sum(cost_usd), 0)::float8 from repli.usage_logs where created_at >= date_trunc('month', now())) as "monthSpend",
+        (select count(*)::int from repli.error_logs where resolved = false) as "openErrors"
+    `)) as Array<Record<string, unknown>>;
+    const s = rows[0];
     return {
-      id: String(r.id),
-      name: String(r.name ?? ""),
-      createdAt: toDate(r.createdAt),
-      agentEnabled: Boolean(r.agentEnabled),
-      activatedAt,
-      subscriptionDays: Number(r.subscriptionDays) || 30,
-      whatsappStatus: String(r.whatsappStatus ?? "disconnected"),
-      instagramStatus: String(r.instagramStatus ?? "disconnected"),
-      whatsappLinked: Boolean(r.whatsappLinked),
-      instagramLinked: Boolean(r.instagramLinked),
-      newOrders: Number(r.newOrders) || 0,
-      conversationCount: Number(r.conversationCount) || 0,
-      openErrors: Number(r.openErrors) || 0,
-      totalSpend: Number(r.totalSpend) || 0,
-      subscription: parsed,
+      restaurantCount: Number(s.restaurantCount) || 0,
+      linkedCount: Number(s.linkedCount) || 0,
+      newOrders: Number(s.newOrders) || 0,
+      monthSpend: Number(s.monthSpend) || 0,
+      openErrors: Number(s.openErrors) || 0,
     };
-  });
-}
+  },
+  "dashboard-stats",
+  15
+);
 
-export async function getRestaurantDetail(id: string) {
-  const rows = (await db.execute(sql`
-    select
-      r.id, r.name, r.created_at as "createdAt",
-      r.agent_enabled as "agentEnabled",
-      r.activated_at as "activatedAt",
-      r.subscription_days as "subscriptionDays",
-      r.whatsapp_jid as "whatsappJid",
-      r.whatsapp_linked as "whatsappLinked",
-      r.whatsapp_status as "whatsappStatus",
-      r.instagram_username as "instagramUsername",
-      r.instagram_linked as "instagramLinked",
-      r.instagram_status as "instagramStatus",
-      r.instagram_token as "instagramToken",
-      r.instagram_ig_id as "instagramIgId",
-      r.menu_images as "menuImages",
-      r.auto_menu_whatsapp as "autoMenuWhatsapp",
-      r.auto_menu_instagram as "autoMenuInstagram",
-      r.link_token as "linkToken",
-      r.total_spend_usd as "totalSpendUsd",
-      c.id as "c_id",
-      c.business_name as "c_businessName",
-      c.tone as "c_tone",
-      c.languages as "c_languages",
-      c.hours as "c_hours",
-      c.delivery_policy as "c_deliveryPolicy",
-      c.menu as "c_menu",
-      c.policies as "c_policies",
-      c.custom_instructions as "c_customInstructions",
-      c.system_prompt as "c_systemPrompt",
-      c.temperature as "c_temperature",
-      c.ask_phone as "c_askPhone",
-      c.ask_address as "c_askAddress",
-      c.updated_at as "c_updatedAt",
-      (select count(*)::int from repli.conversations x where x.restaurant_id = r.id) as "conversationCount",
-      (select count(*)::int from repli.orders x where x.restaurant_id = r.id) as "orderCount"
-    from repli.restaurants r
-    left join repli.agent_configs c on c.restaurant_id = r.id
-    where r.id = ${id}
-  `)) as Array<Record<string, unknown>>;
+export const getRestaurantsOverview = cached(
+  async () => {
+    // One query with correlated subselects instead of 1 + 4×N round trips.
+    const rows = (await db.execute(sql`
+      select
+        r.id, r.name, r.created_at as "createdAt",
+        r.agent_enabled as "agentEnabled",
+        r.activated_at as "activatedAt",
+        r.subscription_days as "subscriptionDays",
+        r.whatsapp_status as "whatsappStatus",
+        r.instagram_status as "instagramStatus",
+        r.whatsapp_linked as "whatsappLinked",
+        r.instagram_linked as "instagramLinked",
+        (select count(*)::int from repli.orders o where o.restaurant_id = r.id and o.status = 'new') as "newOrders",
+        (select count(*)::int from repli.conversations c where c.restaurant_id = r.id) as "conversationCount",
+        (select count(*)::int from repli.error_logs e where e.restaurant_id = r.id and e.resolved = false) as "openErrors",
+        (select coalesce(sum(u.cost_usd), 0)::float8 from repli.usage_logs u where u.restaurant_id = r.id) as "totalSpend"
+      from repli.restaurants r
+      order by r.created_at desc
+    `)) as Array<Record<string, unknown>>;
 
-  const row = rows[0];
-  if (!row) return null;
-  const config = row.c_id
-    ? {
-        id: String(row.c_id),
-        restaurantId: id,
-        businessName: String(row.c_businessName ?? ""),
-        tone: String(row.c_tone ?? "friendly"),
-        languages: String(row.c_languages ?? "ar,en"),
-        hours: String(row.c_hours ?? ""),
-        deliveryPolicy: String(row.c_deliveryPolicy ?? ""),
-        menu: String(row.c_menu ?? ""),
-        policies: String(row.c_policies ?? ""),
-        customInstructions: String(row.c_customInstructions ?? ""),
-        systemPrompt: String(row.c_systemPrompt ?? ""),
-        temperature: Number(row.c_temperature ?? 0.7),
-        askPhone: Boolean(row.c_askPhone),
-        askAddress: Boolean(row.c_askAddress),
-        updatedAt: toDate(row.c_updatedAt),
-      }
-    : null;
+    return rows.map((r) => {
+      const activatedAt = toDate(r.activatedAt);
+      const parsed = subscriptionInfo(activatedAt, Number(r.subscriptionDays));
+      return {
+        id: String(r.id),
+        name: String(r.name ?? ""),
+        createdAt: toDate(r.createdAt),
+        agentEnabled: Boolean(r.agentEnabled),
+        activatedAt,
+        subscriptionDays: Number(r.subscriptionDays) || 30,
+        whatsappStatus: String(r.whatsappStatus ?? "disconnected"),
+        instagramStatus: String(r.instagramStatus ?? "disconnected"),
+        whatsappLinked: Boolean(r.whatsappLinked),
+        instagramLinked: Boolean(r.instagramLinked),
+        newOrders: Number(r.newOrders) || 0,
+        conversationCount: Number(r.conversationCount) || 0,
+        openErrors: Number(r.openErrors) || 0,
+        totalSpend: Number(r.totalSpend) || 0,
+        subscription: parsed,
+      };
+    });
+  },
+  "restaurants-overview",
+  15
+);
 
-  return {
-    id: String(row.id),
-    name: String(row.name ?? ""),
-    createdAt: toDate(row.createdAt),
-    agentEnabled: Boolean(row.agentEnabled),
-    activatedAt: toDate(row.activatedAt),
-    subscriptionDays: Number(row.subscriptionDays) || 30,
-    whatsappJid: (row.whatsappJid as string | null) ?? null,
-    whatsappLinked: Boolean(row.whatsappLinked),
-    whatsappStatus: String(row.whatsappStatus ?? "disconnected"),
-    instagramUsername: (row.instagramUsername as string | null) ?? null,
-    instagramLinked: Boolean(row.instagramLinked),
-    instagramStatus: String(row.instagramStatus ?? "disconnected"),
-    instagramToken: (row.instagramToken as string | null) ?? null,
-    instagramIgId: (row.instagramIgId as string | null) ?? null,
-    menuImages: String(row.menuImages ?? "[]"),
-    autoMenuWhatsapp: Boolean(row.autoMenuWhatsapp),
-    autoMenuInstagram: Boolean(row.autoMenuInstagram),
-    linkToken: (row.linkToken as string | null) ?? null,
-    totalSpendUsd: Number(row.totalSpendUsd) || 0,
-    agent: config,
-    conversationCount: Number(row.conversationCount) || 0,
-    orderCount: Number(row.orderCount) || 0,
-  };
-}
+export const getRestaurantDetail = cached(
+  async (id: string) => {
+    const rows = (await db.execute(sql`
+      select
+        r.id, r.name, r.created_at as "createdAt",
+        r.agent_enabled as "agentEnabled",
+        r.activated_at as "activatedAt",
+        r.subscription_days as "subscriptionDays",
+        r.whatsapp_jid as "whatsappJid",
+        r.whatsapp_linked as "whatsappLinked",
+        r.whatsapp_status as "whatsappStatus",
+        r.instagram_username as "instagramUsername",
+        r.instagram_linked as "instagramLinked",
+        r.instagram_status as "instagramStatus",
+        r.instagram_token as "instagramToken",
+        r.instagram_ig_id as "instagramIgId",
+        r.menu_images as "menuImages",
+        r.auto_menu_whatsapp as "autoMenuWhatsapp",
+        r.auto_menu_instagram as "autoMenuInstagram",
+        r.link_token as "linkToken",
+        r.total_spend_usd as "totalSpendUsd",
+        c.id as "c_id",
+        c.business_name as "c_businessName",
+        c.tone as "c_tone",
+        c.languages as "c_languages",
+        c.hours as "c_hours",
+        c.delivery_policy as "c_deliveryPolicy",
+        c.menu as "c_menu",
+        c.policies as "c_policies",
+        c.custom_instructions as "c_customInstructions",
+        c.system_prompt as "c_systemPrompt",
+        c.temperature as "c_temperature",
+        c.ask_phone as "c_askPhone",
+        c.ask_address as "c_askAddress",
+        c.updated_at as "c_updatedAt",
+        (select count(*)::int from repli.conversations x where x.restaurant_id = r.id) as "conversationCount",
+        (select count(*)::int from repli.orders x where x.restaurant_id = r.id) as "orderCount"
+      from repli.restaurants r
+      left join repli.agent_configs c on c.restaurant_id = r.id
+      where r.id = ${id}
+    `)) as Array<Record<string, unknown>>;
+
+    const row = rows[0];
+    if (!row) return null;
+    const config = row.c_id
+      ? {
+          id: String(row.c_id),
+          restaurantId: id,
+          businessName: String(row.c_businessName ?? ""),
+          tone: String(row.c_tone ?? "friendly"),
+          languages: String(row.c_languages ?? "ar,en"),
+          hours: String(row.c_hours ?? ""),
+          deliveryPolicy: String(row.c_deliveryPolicy ?? ""),
+          menu: String(row.c_menu ?? ""),
+          policies: String(row.c_policies ?? ""),
+          customInstructions: String(row.c_customInstructions ?? ""),
+          systemPrompt: String(row.c_systemPrompt ?? ""),
+          temperature: Number(row.c_temperature ?? 0.7),
+          askPhone: Boolean(row.c_askPhone),
+          askAddress: Boolean(row.c_askAddress),
+          updatedAt: toDate(row.c_updatedAt),
+        }
+      : null;
+
+    return {
+      id: String(row.id),
+      name: String(row.name ?? ""),
+      createdAt: toDate(row.createdAt),
+      agentEnabled: Boolean(row.agentEnabled),
+      activatedAt: toDate(row.activatedAt),
+      subscriptionDays: Number(row.subscriptionDays) || 30,
+      whatsappJid: (row.whatsappJid as string | null) ?? null,
+      whatsappLinked: Boolean(row.whatsappLinked),
+      whatsappStatus: String(row.whatsappStatus ?? "disconnected"),
+      instagramUsername: (row.instagramUsername as string | null) ?? null,
+      instagramLinked: Boolean(row.instagramLinked),
+      instagramStatus: String(row.instagramStatus ?? "disconnected"),
+      instagramToken: (row.instagramToken as string | null) ?? null,
+      instagramIgId: (row.instagramIgId as string | null) ?? null,
+      menuImages: String(row.menuImages ?? "[]"),
+      autoMenuWhatsapp: Boolean(row.autoMenuWhatsapp),
+      autoMenuInstagram: Boolean(row.autoMenuInstagram),
+      linkToken: (row.linkToken as string | null) ?? null,
+      totalSpendUsd: Number(row.totalSpendUsd) || 0,
+      agent: config,
+      conversationCount: Number(row.conversationCount) || 0,
+      orderCount: Number(row.orderCount) || 0,
+    };
+  },
+  "restaurant-detail",
+  10
+);
 
 export const getRestaurantConversations = cached(
   async (restaurantId: string) => {
@@ -292,21 +304,26 @@ export const getRestaurantOrders = cached(
 
 export const getRestaurantUsage = cached(
   async (restaurantId: string) => {
-    const logs = await db
-      .select()
-      .from(usageLogs)
-      .where(eq(usageLogs.restaurantId, restaurantId))
-      .orderBy(desc(usageLogs.createdAt))
-      .limit(400);
-    const total = await db
-      .select({
-        input: sql<number>`coalesce(sum(${usageLogs.inputTokens}), 0)`,
-        output: sql<number>`coalesce(sum(${usageLogs.outputTokens}), 0)`,
-        cost: sql<number>`coalesce(sum(${usageLogs.costUsd}), 0)`,
-        audio: sql<number>`coalesce(sum(${usageLogs.audioSeconds}), 0)`,
-      })
-      .from(usageLogs)
-      .where(eq(usageLogs.restaurantId, restaurantId));
+    // Run the detail rows and the aggregate in parallel — two round trips to a
+    // remote Supabase instead of a sequential 2×RTT waterfall (per restaurant
+    // usage tab load).
+    const [logs, total] = await Promise.all([
+      db
+        .select()
+        .from(usageLogs)
+        .where(eq(usageLogs.restaurantId, restaurantId))
+        .orderBy(desc(usageLogs.createdAt))
+        .limit(400),
+      db
+        .select({
+          input: sql<number>`coalesce(sum(${usageLogs.inputTokens}), 0)`,
+          output: sql<number>`coalesce(sum(${usageLogs.outputTokens}), 0)`,
+          cost: sql<number>`coalesce(sum(${usageLogs.costUsd}), 0)`,
+          audio: sql<number>`coalesce(sum(${usageLogs.audioSeconds}), 0)`,
+        })
+        .from(usageLogs)
+        .where(eq(usageLogs.restaurantId, restaurantId)),
+    ]);
     return { logs, totals: total[0] };
   },
   "restaurant-usage",

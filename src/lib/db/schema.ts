@@ -208,6 +208,7 @@ export const usageLogs = repli.table(
       .notNull()
       .references(() => restaurants.id, { onDelete: "cascade" }),
     model: text("model").notNull().default(""),
+    keyLabel: text("key_label").notNull().default(""),
     inputTokens: integer("input_tokens").notNull().default(0),
     outputTokens: integer("output_tokens").notNull().default(0),
     audioSeconds: integer("audio_seconds").notNull().default(0),
@@ -221,6 +222,61 @@ export const usageLogs = repli.table(
       restaurantIdx: index("usage_logs_restaurant_idx").on(
         t.restaurantId,
         t.createdAt
+      ),
+    };
+  }
+);
+
+export const telegramBots = repli.table(
+  "telegram_bots",
+  {
+    id: text("id").primaryKey(),
+    restaurantId: text("restaurant_id")
+      .notNull()
+      .references(() => restaurants.id, { onDelete: "cascade" }),
+    botToken: text("bot_token").notNull().default(""),
+    webhookSecret: text("webhook_secret").notNull().default(""),
+    botUsername: text("bot_username"),
+    chatId: text("chat_id"),
+    enabled: boolean("enabled").notNull().default(false),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`now()`),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .default(sql`now()`),
+  },
+  (t) => {
+    return {
+      restaurantIdx: uniqueIndex("telegram_bots_restaurant_idx").on(
+        t.restaurantId
+      ),
+    };
+  }
+);
+
+export const telegramOrderDeliveries = repli.table(
+  "telegram_order_deliveries",
+  {
+    id: text("id").primaryKey(),
+    restaurantId: text("restaurant_id")
+      .notNull()
+      .references(() => restaurants.id, { onDelete: "cascade" }),
+    requestedAt: timestamp("requested_at", { withTimezone: true })
+      .notNull()
+      .default(sql`now()`),
+    customerName: text("customer_name"),
+    phone: text("phone"),
+    address: text("address"),
+    itemsJson: text("items_json").notNull().default("[]"),
+    total: real("total"),
+    text: text("text").notNull().default(""),
+  },
+  (t) => {
+    return {
+      restaurantIdx: index("telegram_order_deliveries_restaurant_idx").on(
+        t.restaurantId,
+        t.requestedAt
       ),
     };
   }
@@ -265,3 +321,6 @@ export type UsageLog = typeof usageLogs.$inferSelect;
 export type ErrorLog = typeof errorLogs.$inferSelect;
 export type GatewaySession = typeof gatewaySessions.$inferSelect;
 export type NewGatewaySession = typeof gatewaySessions.$inferInsert;
+export type TelegramBot = typeof telegramBots.$inferSelect;
+export type NewTelegramBot = typeof telegramBots.$inferInsert;
+export type TelegramOrderDelivery = typeof telegramOrderDeliveries.$inferSelect;

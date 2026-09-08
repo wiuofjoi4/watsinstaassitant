@@ -41,7 +41,12 @@ export async function GET() {
   const appUrl = process.env.NEXT_PUBLIC_APP_URL ?? "https://watsinstaassitant.vercel.app";
   // Never include this route itself in the warm list — a self-call would just
   // queue more invocations.
-  const warmPaths = [`${appUrl}/login`, `${appUrl}/admin`];
+  const warmPaths = [
+    `${appUrl}/login`,
+    `${appUrl}/admin`,
+    `${appUrl}/admin/restaurants`,
+    `${appUrl}/api/sync`,
+  ];
   try {
     const rows = (await rawClient`
     select link_token from repli.restaurants where link_token is not null limit 3
@@ -56,11 +61,17 @@ export async function GET() {
     // warming is best-effort; never fail the keep-alive because of it
   }
 
+  const secret = process.env.GATEWAY_SECRET;
   const warmed = await Promise.allSettled(
     warmPaths.map((p) =>
       fetch(p, {
         cache: "no-store",
         signal: AbortSignal.timeout(12_000),
+        // /api/sync is secret-guarded; without the header it returns 401
+        // (still keeps the function warm, but this exercises the real path).
+        headers: p.endsWith("/api/sync")
+          ? { "x-gateway-secret": secret ?? "" }
+          : undefined,
       }).then((res) => ({ path: p.replace(appUrl, ""), ok: res.ok, status: res.status }))
     )
   );

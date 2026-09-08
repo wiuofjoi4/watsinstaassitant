@@ -19,10 +19,22 @@ let client: ReturnType<typeof postgres> | undefined;
 function createClient(): ReturnType<typeof postgres> {
   return postgres(url, {
     ssl: process.env.NODE_ENV === "production" ? "require" : "prefer",
-    max: 5,
+    // Keep the per-instance pool tiny: Vercel keeps many lambda instances warm,
+    // and the Supabase transaction pooler (port 6543) caps pooled connections
+    // (~60). max=1 pools on each warm instance would queue requests behind a
+    // single socket; max=2 gives a small safety margin without saturating the
+    // pooler / producing `write CONNECT_TIMEOUT` storms.
+    max: 2,
     prepare: false,
-    idle_timeout: 20,
-    connect_timeout: 10,
+    // Keep pooled sockets alive long so warm lambda instances don't churn
+    // TCP/TLS reconnects to the Singapore pooler on every turn (each reconnect
+    // is a chance for a `write CONNECT_TIMEOUT`).
+    idle_timeout: 300,
+    // Short connect timeout: when the DB is unreachable, fail in ~8s instead of
+    // letting every queued query stall and blow the 60s Vercel function budget
+    // (a DB-down window previously looked like "reply takes >1 minute, then
+    // nothing").
+    connect_timeout: 8,
   });
 }
 
