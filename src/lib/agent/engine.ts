@@ -94,6 +94,12 @@ const HISTORY_LIMIT = 24;
 // the lambda is killed — never a silent gap.
 const REPLY_BUDGET_MS = 12_000;
 const SIDE_BUDGET_MS = 4_000;
+// Order side-calls (menu classifier + extractor) run the SAME reasoning model
+// as the main reply, which often needs ~10s wall-clock. With a 4s budget they
+// timeout, sendMenuImages flips true, and canExtract is disabled — confirmed
+// orders then never reach Telegram. The budget above covers a reasoning call;
+// it stays bounded by the 35s handler deadline + 60s function budget.
+const ORDER_SIDE_BUDGET_MS = 10_000;
 const TRANSCRIBE_TIMEOUT_MS = 10_000;
 const HANDLER_DEADLINE_MS = 35_000;
 
@@ -465,6 +471,29 @@ export interface RunResult {
   }>;
 }
 
+/** Lenient JSON recovery: accepts bare JSON, code-fenced JSON, and JSON buried
+ * in prose (reasoning models rarely emit an isolated code block on demand).
+ * Returns null when nothing parseable exists. */
+function parseJsonSafe(raw: string): unknown | null {
+  if (!raw || !raw.trim()) return null;
+  let s = raw.trim().replace(/^```[a-z]*\s*/i, "").replace(/\s*```/i, "").trim();
+  try {
+    return JSON.parse(s);
+  } catch {
+    // fall through
+  }
+  const firstBrace = s.indexOf("{");
+  const lastBrace = s.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    try {
+      return JSON.parse(s.slice(firstBrace, lastBrace + 1));
+    } catch {
+      // fall through
+    }
+  }
+  return null;
+}
+
 async function extractOrder(
   profile: BusinessProfile,
   conversationId: string
@@ -491,6 +520,11 @@ async function extractOrder(
       {
         model: getAgentModel(),
         temperature: 0,
+        // The free reasoning model spends its output budget on "thinking"
+        // first; at 650 tokens reasoning consumed everything and content came
+        // back empty (proven on OpenRouter: out=650 everything=reasoning).
+        // 1500 leaves room for reasoning + the actual JSON.
+        max_tokens: 1500,
         response_format: getProvider() === "openrouter" ? undefined : { type: "json_object" },
         messages: [
           {
@@ -501,17 +535,32 @@ async function extractOrder(
               `Return strictly this JSON shape: ${payload}`,
               `"items" is an array of {name: string, qty: number, price: number}. Use the menu prices above; if unsure, keep the products the customer agreed on and price=0.`,
               `"total" is the sum. "phone" and "address" may be null if not mentioned.`,
+              `Do not wrap the JSON in prose or markdown.`,
             ].join("\n"),
           },
           ...historyMessages,
         ],
       },
-      { budgetMs: SIDE_BUDGET_MS, timeoutMs: SIDE_BUDGET_MS + 2_000 }
+      { budgetMs: ORDER_SIDE_BUDGET_MS, timeoutMs: ORDER_SIDE_BUDGET_MS + 2_000 }
     );
     const raw = res.choices[0]?.message?.content ?? "";
-    const parsed = JSON.parse(raw.startsWith("```") ? raw.replace(/```json|```/g, "").trim() : raw) as AgentOrderResult;
+    const parsed = parseJsonSafe(raw) as AgentOrderResult | null;
+    if (!parsed) {
+      await insertErrorBestEffort(
+        profile.restaurant.id,
+        "telegram",
+        "extractOrder: unparseable AI output",
+        new Error(`raw(excerpt)=${String(raw).slice(0, 300)}`)
+      );
+    }
     return parsed && typeof parsed === "object" ? parsed : null;
-  } catch {
+  } catch (err) {
+    await insertErrorBestEffort(
+      profile.restaurant.id,
+      "telegram",
+      "extractOrder: LLM call failed",
+      err
+    );
     return null;
   }
 }
@@ -537,6 +586,7 @@ async function isOrderMessage(
       {
         model: getAgentModel(),
         temperature: 0,
+        max_tokens: 1500,
         response_format: getProvider() === "openrouter" ? undefined : { type: "json_object" },
         messages: [
           {
@@ -552,13 +602,11 @@ async function isOrderMessage(
           { role: "user", content: trimmed },
         ],
       },
-      { budgetMs: SIDE_BUDGET_MS, timeoutMs: SIDE_BUDGET_MS + 2_000 }
+      { budgetMs: ORDER_SIDE_BUDGET_MS, timeoutMs: ORDER_SIDE_BUDGET_MS + 2_000 }
     );
     const raw = res.choices[0]?.message?.content ?? "";
-    const parsed = JSON.parse(
-      raw.startsWith("```") ? raw.replace(/```json|```/g, "").trim() : raw
-    ) as { isOrder?: boolean };
-    return parsed.isOrder === true;
+    const parsed = parseJsonSafe(raw) as { isOrder?: boolean } | null;
+    return parsed?.isOrder === true;
   } catch {
     return false;
   }
@@ -752,9 +800,7 @@ async function runIncomingMessage(
       input.contentType === "voice" ||
       input.contentType === "image";
     const canExtract =
-      conversation.status !== "manual" &&
-      !(menuToggle && sendMenuImages) &&
-      orderHint;
+      conversation.status !== "manual" && orderHint;
     extractPromise = canExtract
       ? extractOrder(profile, conversation.id).catch(() => null)
       : null;
@@ -893,7 +939,7 @@ async function runIncomingMessage(
   const order = extractPromise
     ? await withDeadline(
         extractPromise,
-        Math.min(SIDE_BUDGET_MS, Math.max(0, deadline - Date.now()))
+        Math.min(ORDER_SIDE_BUDGET_MS, Math.max(0, deadline - Date.now()))
       ).catch(() => null)
     : null;
   step("extractOrder");
@@ -912,10 +958,15 @@ async function runIncomingMessage(
     // maxDuration instead of the shrinking handler deadline — a slow/cold DB
     // insert previously left deliveries stranded with no Telegram message and
     // no log. Failures are logged (see notifyTelegramOrder) and re-logged here.
-    after(() => {
-      withDeadline(notifyTelegramOrder(input.restaurantId, order), 20_000).catch((err) =>
-        insertErrorBestEffort(input.restaurantId, "telegram", "notifyTelegramOrder failed", err)
-      );
+    // The callback MUST return the awaited promise: an un-awaited floating
+    // promise lets Next consider `after` done instantly and the lambda is torn
+    // down before the insert+send completes.
+    after(async () => {
+      try {
+        await withDeadline(notifyTelegramOrder(input.restaurantId, order), 20_000);
+      } catch (err) {
+        await insertErrorBestEffort(input.restaurantId, "telegram", "notifyTelegramOrder failed", err);
+      }
     });
   }
 

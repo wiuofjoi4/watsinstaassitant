@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
+import { after } from "next/server";
 import { desc, eq, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { first } from "@/lib/db/query";
+import { newId } from "@/lib/utils";
 import {
   conversations,
   errorLogs,
@@ -30,6 +32,91 @@ export async function GET(req: NextRequest) {
   }
 
   const action = req.nextUrl.searchParams.get("action");
+  if (action === "cfg") {
+    const rows = await db
+      .select({
+        id: restaurants.id,
+        name: restaurants.name,
+        agentEnabled: restaurants.agentEnabled,
+        autoMenuWhatsapp: restaurants.autoMenuWhatsapp,
+        autoMenuInstagram: restaurants.autoMenuInstagram,
+      })
+      .from(restaurants)
+      .limit(10);
+    return NextResponse.json({ restaurants: rows });
+  }
+  if (action === "testAfter") {
+    after(async () => {
+      await db
+        .insert(errorLogs)
+        .values({
+          id: newId(),
+          restaurantId: "seed-restaurant-1",
+          source: "diag",
+          message: `diag: after() test fired at ${new Date().toISOString()}`,
+        })
+        .catch(() => {});
+    });
+    return NextResponse.json({ scheduled: true, at: new Date().toISOString() });
+  }
+  if (action === "logs") {
+    const rows = await db
+      .select({
+        createdAt: errorLogs.createdAt,
+        restaurantId: errorLogs.restaurantId,
+        message: errorLogs.message,
+        stack: errorLogs.stack,
+      })
+      .from(errorLogs)
+      .orderBy(desc(errorLogs.createdAt))
+      .limit(15);
+    return NextResponse.json({ errorLogs: rows });
+  }
+  if (action === "deliveries") {
+    const rows = await db
+      .select({
+        id: telegramOrderDeliveries.id,
+        requestedAt: telegramOrderDeliveries.requestedAt,
+        restaurantId: telegramOrderDeliveries.restaurantId,
+        customerName: telegramOrderDeliveries.customerName,
+        phone: telegramOrderDeliveries.phone,
+        total: telegramOrderDeliveries.total,
+        text: telegramOrderDeliveries.text,
+      })
+      .from(telegramOrderDeliveries)
+      .limit(10);
+    return NextResponse.json({ deliveries: rows });
+  }
+  if (action === "convs") {
+    const rows = await db
+      .select({
+        id: conversations.id,
+        restaurantId: conversations.restaurantId,
+        status: conversations.status,
+        lastMessageAt: conversations.lastMessageAt,
+      })
+      .from(conversations)
+      .orderBy(desc(conversations.lastMessageAt))
+      .limit(8);
+    return NextResponse.json({ conversations: rows });
+  }
+  if (action === "messages") {
+    const convId = req.nextUrl.searchParams.get("conversation");
+    if (!convId) return NextResponse.json({ error: "missing conversation" });
+    const rows = await db
+      .select({
+        direction: messages.direction,
+        contentType: messages.contentType,
+        text: messages.text,
+        createdAt: messages.createdAt,
+      })
+      .from(messages)
+      .where(eq(messages.conversationId, convId))
+      .orderBy(desc(messages.createdAt))
+      .limit(25);
+    return NextResponse.json({ thread: rows.reverse() });
+  }
+
   if (action === "cleanupTest") {
     await db
       .delete(telegramOrderDeliveries)
