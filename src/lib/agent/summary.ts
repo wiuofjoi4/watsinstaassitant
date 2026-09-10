@@ -82,8 +82,11 @@ export function sanitizeOrder(raw: unknown): AgentOrderResult | null {
   const itemSum = items.reduce((s, i) => s + i.qty * i.price, 0);
   return {
     // A hallucinated "ready" must never push an empty order: items AND phone
-    // are the minimum contract for a delivery.
+    // are the minimum contract for a delivery. The model's raw intent is kept
+    // on rawReady so the engine can still finalize phone-less confirmed orders
+    // (WhatsApp lid JIDs) after filling/verifying the number.
     ready: o.ready === true && items.length > 0 && !!phone,
+    rawReady: o.ready === true,
     items,
     total: total ?? itemSum,
     phone,

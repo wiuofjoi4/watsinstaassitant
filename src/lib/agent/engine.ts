@@ -64,6 +64,10 @@ export interface AgentOrderResult {
   phone?: string | null;
   address?: string | null;
   customerName?: string | null;
+  /** The model's raw ready:true BEFORE sanitizeOrder zeroed it for a missing
+   * phone — lets the engine honor a genuinely finalized order (e.g. WhatsApp
+   * privacy/lid JIDs expose no number) while still blocking empty blocks. */
+  rawReady?: boolean;
 }
 
 function normalizeItems(
@@ -205,6 +209,7 @@ ${
     : `- ready=true فقط إذا توفَّرت الأصناف ورقم الهاتف معاً (وإن توفر العنوان احفظه أيضاً).`
 }
 - في كل تحديث للطلب أعد كتابة الكتلة بالحالة الكاملة (لا تلخص جزئياً).
+- مع كل طلب توصيل اسأل عن العنوان مجدداً — حتى لنفس الزبون الذي أعطاه في طلب سابق — ولا تعيد استخدام عنوان قديم إلا إذا صرّح الزبون بنفسه به.
 - إن لم تكن المحادثة عن طلب جارٍ فلا تكتب الكتلة إطلاقاً.`;
 }
 
@@ -528,7 +533,9 @@ async function buildMessages(
   input: IncomingMessageInput,
   context: CondensedContext,
   menuNote?: string,
-  senderPhone?: string | null
+  senderPhone?: string | null,
+  clearedContext?: CondensedContext | null,
+  clearNote?: string
 ): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam[]> {
   // ONE request per turn: the current message + a compact deterministic
   // summary of everything before it. Never resend the raw log in every call —
@@ -536,9 +543,13 @@ async function buildMessages(
   // Always rebuild the system prompt here (buildSystemPrompt) instead of the
   // stored config.systemPrompt: the stored copy was frozen at save time and
   // still carried stale instructions (ORDER_SUMMARY, ask-for-phone, emojis).
-  const effectiveContext: CondensedContext = context.phone
-    ? context
-    : { ...context, phone: senderPhone ?? null };
+  // On a NEW-order opener the cleared context replaces the condensed one so the
+  // model never sees the previous order's items/address.
+  const effectiveContext: CondensedContext =
+    clearedContext ??
+    (context.phone
+      ? context
+      : { ...context, phone: senderPhone ?? null });
 
   // Full menu only when this turn may actually need it — order/price/menu
   // intent, or a bare image (likely a food photo the model must map to the
@@ -557,6 +568,7 @@ async function buildMessages(
     buildSystemPrompt(profile, { senderPhone, includeMenu: menuNeeded }) +
     orderContract(senderPhone) +
     (menuNote ? `\n\n${menuNote}` : "") +
+    (clearNote ? `\n\n${clearNote}` : "") +
     `\n\n${renderContextBlock(effectiveContext)}`;
 
   const currentUserText = input.text ?? "";
@@ -602,7 +614,59 @@ const ORDER_INTENT =
 // A bare confirmation ("تمام", "نعم", "موافق"...) is not an order by itself,
 // but when it closes a chat that already carries order context (a product or
 // a phone number in the recent exchange) the Telegram push must still fire.
-const ORDER_CONFIRM = /تمام|نعم|اكيد|أكيد|موافق|زين|هيه|yes|\bok\b/i;
+const ORDER_CONFIRM =
+  /تمام|نعم|اكيد|أكيد|موافق|زين|هيه|اوكي|أوكي|صحيح|تم\b|[أا]تفقنا|خلاص|\b(ok|okay|yes|agree|confirmed|fine|sure|right|sounds good)\b/i;
+
+// A message signaling a brand-NEW order (not a continuation of a stocked one).
+// Only matters once there is already order material in the conversation — on a
+// fresh chat there is nothing to reset. Distinguishing start vs. continue keeps
+// "السلام عليكم ممكن اطلب" from re-closing a previous order and re-pushing it.
+const ORDER_START =
+  /عندي طلب|ابي اطلب|أريد اطلب|أريد أطلب|ابي بطلب|ابي اكل|أريد بطلب|بغيت اطلب|بطلع اطلب|ممكن اطلب|اطلب منكم|اطلب طلب|طلب جديد|أريد اطلب جديد|ودي اطلب|ابه اطلب|ودي بطلب|راح اطلب|طلبة منك|أريد اطلب مني/i;
+
+// Explicit continuation phrases ("زين اطلبهم"، "نفس الطلب") signal the customer
+// is ADDING to the current order — must NOT be treated as a fresh start.
+const ORDER_CONTINUE =
+  /اطلبهم|اطلبها|اطلبو|اضيف|أضيف|زد عليهم|كثر|نفس الطلب|نفس الاصناف|نفس الأصناف|اطلبلي|اسويها/i;
+
+// Recover the most recent [ORDER_STATE] block the bot itself stored, so a
+// bare-confirmation turn ("زين، خلاص" with no block in the model's reply) can
+// still close & push the pending order instead of silently dropping it. Scoped
+// to the last 3h so a stale block from an earlier chat never resurrects into a
+// fresh confirmation.
+async function findLastStoredOrder(
+  conversationId: string,
+  restaurantId: string
+): Promise<AgentOrderResult | null> {
+  try {
+    const cutoff = new Date(Date.now() - 3 * 60 * 60 * 1000);
+    const rows = await db
+      .select({ text: messages.text })
+      .from(messages)
+      .where(
+        and(
+          eq(messages.conversationId, conversationId),
+          eq(messages.direction, "out"),
+          gte(messages.createdAt, cutoff)
+        )
+      )
+      .orderBy(desc(messages.createdAt))
+      .limit(6);
+    for (const row of rows) {
+      if (!row.text) continue;
+      const stored = parseOrderBlock(row.text);
+      if (stored && stored.items.length > 0) return stored;
+    }
+  } catch (err) {
+    await insertErrorBestEffort(
+      restaurantId,
+      "agent",
+      "findLastStoredOrder failed",
+      err
+    );
+  }
+  return null;
+}
 
 // Menu-delivery gate: the FULL menu is only worth its tokens on turns that
 // actually touch the menu — asking for availability, prices, or the menu
@@ -785,9 +849,10 @@ async function runIncomingMessage(
   const context = condenseMessages(historyRows);
 
   // The customer's phone comes from WhatsApp itself (sender number) — never
-  // make the customer type it. If they typed a DIFFERENT number recently, that
-  // one wins; otherwise the sender's is the order's phone. Instagram only: its
-  // remoteJid is an internal user ID, NOT a phone — leave it to be asked there.
+  // make the customer type it. The sender number is applied as the
+  // AUTHORITATIVE phone on every completed order below (the owner verifies from
+  // WhatsApp). Instagram: its remoteJid is an internal user ID, NOT a phone —
+  // leave it to be asked there.
   const senderPhone =
     input.channel === "whatsapp" ? jidToPhone(input.remoteJid) : null;
   const effectiveContext: CondensedContext =
@@ -798,6 +863,30 @@ async function runIncomingMessage(
   const orderIntent =
     ORDER_INTENT.test(effectiveText) ||
     (ORDER_CONFIRM.test(effectiveText) && context.hasOrderMaterial);
+
+  // A NEW-order opener on a chat that already holds old order material. The
+  // model must start from scratch (cleared context + note) instead of
+  // confirming/re-pushing the previous order. (grep: user bug #2)
+  const isOrderStart =
+    ORDER_START.test(effectiveText) &&
+    !ORDER_CONTINUE.test(effectiveText) &&
+    context.hasOrderMaterial;
+  // Items/address/total are wiped from the context handed to the model (phone
+  // kept — it comes from the WhatsApp sender anyway). Old order state never
+  // leaks into a fresh order.
+  const clearedContext: CondensedContext | null =
+    isOrderStart && context.hasOrderMaterial
+      ? {
+          ...context,
+          items: [],
+          total: null,
+          address: null,
+          hasOrderMaterial: false,
+        }
+      : null;
+  const newOrderNote = clearedContext
+    ? `Note for THIS turn only: the customer is STARTING a NEW order. Disregard any previous items, quantities, prices or address from earlier turns — this is a fresh order. Do NOT carry over, summarize or confirm the old one. Ask for the current items and the delivery address again.`
+    : undefined;
 
   let sendMenuImages = false;
   const rawMenuImages = parseMenuImages(profile.restaurant.menuImages);
@@ -848,7 +937,9 @@ async function runIncomingMessage(
         sendMenuImages
           ? `Note for THIS reply only: you will also send the customer the menu pictures along with your text. Acknowledge in one short line that you are sending the menu, and do NOT repeat the whole menu in text.`
           : undefined,
-        senderPhone
+        senderPhone,
+        clearedContext,
+        newOrderNote
       );
       const res = await completeWithFallback(
         {
@@ -918,36 +1009,80 @@ async function runIncomingMessage(
   // reliable on models). If stripping empties the reply, keep the original.
   if (cleanReply) replyText = stripEmojis(cleanReply) || cleanReply;
 
-  // Deterministic fallback: if the model wrote no block but this turn clearly
-  // continues a stocked order (explicit intent + prior items), close it — the
-  // Telegram push must never depend on the model remembering the format. The
-  // phone is taken from effectiveContext (auto-filled from the sender's
-  // WhatsApp number) so it can never block the order.
-  let order: AgentOrderResult | null =
-    parsedOrder ??
-    (orderIntent && context.hasOrderMaterial && context.items.length > 0
-      ? {
-          ready: true,
-          items: context.items,
-          total:
-            context.total ??
-            context.items.reduce((s, i) => s + i.qty * i.price, 0),
-          phone: effectiveContext.phone,
-          address: effectiveContext.address,
-          customerName: effectiveContext.customerName,
-        }
-      : null);
+  // Deterministic closure so the Telegram push never depends on the model
+  // remembering the [ORDER_STATE] format. Preference order:
+  // 1) the block the model wrote this turn;
+  // 2) parked in-context items when this turn carries order intent;
+  // 3) the last block the bot itself stored, when the customer ONLY confirmed
+  //    ("اوكي/زين") and no block came back — a stored-pending order must never
+  //    be swallowed. A NEW-order opener (isOrderStart) never closes a previous
+  //    order — it resets instead (see clearedContext above).
+  let order: AgentOrderResult | null = parsedOrder;
+  if (!order && !isOrderStart && orderIntent && context.hasOrderMaterial) {
+    if (context.items.length > 0) {
+      order = {
+        ready: true,
+        items: context.items,
+        total:
+          context.total ??
+          context.items.reduce((s, i) => s + i.qty * i.price, 0),
+        phone: effectiveContext.phone,
+        address: effectiveContext.address,
+        customerName: effectiveContext.customerName,
+      };
+    } else {
+      const stored = await findLastStoredOrder(
+        conversation.id,
+        input.restaurantId
+      );
+      if (stored && stored.items.length > 0) {
+        order = { ...stored, ready: true };
+      }
+    }
+  }
 
-  // Normalize the phone on every completed order: the sender number fills any
-  // gap (model omitted it), which also promotes a blocked order to ready. The
-  // pushed order must never be missing a contact number the owner can call.
+  // WhatsApp: the sender's JID number is AUTHORITATIVE on every order turn —
+  // any phone the model put in the block is overwritten with it (the owner
+  // verifies delivery numbers straight from WhatsApp). Readiness is left
+  // untouched: only the model's ready:true or the deterministic closure above
+  // marks an order final.
   if (
     order &&
     order.items.length > 0 &&
+    input.channel === "whatsapp" &&
+    senderPhone
+  ) {
+    order = { ...order, phone: senderPhone };
+  }
+
+  // Fill a remaining phone gap on finalized orders (Instagram typed number, or
+  // WhatsApp when the sender's JID carried none). NEVER force a blocked/open
+  // order to ready:true — only the model's ready flag or the deterministic
+  // closure above may finalize an order, or a half-collected order would be
+  // pushed to Telegram mid-conversation.
+  if (
+    order &&
+    order.items.length > 0 &&
+    order.ready === true &&
     !order.phone &&
     effectiveContext.phone
   ) {
-    order = { ...order, phone: effectiveContext.phone, ready: true };
+    order = { ...order, phone: effectiveContext.phone };
+  }
+
+  // Honor the model's own ready intent even when a missing phone made the
+  // sanitizer drop it — a confirmed order is confirmed, just without a
+  // callable number (privacy/lid JIDs). Loudly warn ops instead of silently
+  // swallowing the push.
+  if (order && order.items.length > 0 && parsedOrder?.rawReady === true) {
+    order = { ...order, ready: true };
+  }
+  if (order && order.ready && !order.phone) {
+    await insertErrorBestEffort(
+      input.restaurantId,
+      "telegram",
+      `confirmed order pushed WITHOUT a phone (WhatsApp JID exposes no number: ${input.remoteJid})`
+    );
   }
 
   if (rawReply && rawReply.trim() !== "") {
