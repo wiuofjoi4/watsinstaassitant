@@ -75,6 +75,9 @@ interface Session {
   connectionState?: string;
   lastError?: string;
   qrOnce?: boolean;
+  /** Presence heartbeat timer — keeps the WhatsApp socket alive server-side so
+   * the device line is not silently dropped (error 408 / forced re-pair). */
+  heartbeat?: NodeJS.Timeout;
 }
 
 const sessions = new Map<string, Session>();
@@ -274,6 +277,14 @@ async function startSession(restaurantId: string): Promise<void> {
     if (qr) {
       session.qr = qr;
       session.qrOnce = true;
+      if (session.lastJid) {
+        // This is a RE-PAIR, not a first pairing: the WhatsApp session was
+        // previously connected and is being forced to re-authenticate. Loud log
+        // so the owner's Telegram alert (platform status route) has context.
+        logger.warn(
+          `re-pair required for ${restaurantId} (was connected as ${session.lastJid}) — QR presented`
+        );
+      }
       void postStatus(restaurantId, "qr_ready");
     }
     if (connection === "open") {
@@ -281,10 +292,25 @@ async function startSession(restaurantId: string): Promise<void> {
       session.qr = null;
       const jid = socket.user?.id ?? null;
       session.lastJid = jid;
+      // Keep the device line alive server-side. WhatsApp drops sockets that stay
+      // idle too long (408 → forced re-pair needs a fresh QR scan). A gentle
+      // "available" presence every 2 minutes prevents that while the socket
+      // stays healthy. Clear any stale timer from a previous connect first.
+      if (session.heartbeat) clearInterval(session.heartbeat);
+      session.heartbeat = setInterval(() => {
+        try {
+          void session.socket.sendPresenceUpdate("available").catch(() => {});
+        } catch {}
+      }, 120_000);
+      session.heartbeat.unref?.();
       void postStatus(restaurantId, "connected", jid);
     }
     if (connection === "close") {
       session.connected = false;
+      if (session.heartbeat) {
+        clearInterval(session.heartbeat);
+        session.heartbeat = undefined;
+      }
       recordClose(restaurantId, connection, lastDisconnect);
       void postStatus(restaurantId, "disconnected");
       sessions.delete(restaurantId);

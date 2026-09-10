@@ -3,8 +3,13 @@ import { eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { restaurants } from "@/lib/db/schema";
 import { gatewaySecretOk } from "@/lib/env";
+import { sendAlert } from "@/lib/alerts";
+import { first } from "@/lib/db/query";
 
 export const runtime = "nodejs";
+
+const GATEWAY_PUBLIC_URL =
+  process.env.GATEWAY_PUBLIC_URL ?? "https://repli-gateway.onrender.com";
 
 interface StatusBody {
   restaurantId: string;
@@ -30,6 +35,25 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: "Missing fields" }, { status: 400 });
   }
 
+  // Was this restaurant previously linked? A qr_ready AFTER it was linked means
+  // the WhatsApp session was force-logged out (error 408 / stale creds) and the
+  // owner must re-scan — the bot is silent until they do. Alert immediately so
+  // downtime is minutes, not hours.
+  let wasLinked = false;
+  if (body.channel === "whatsapp") {
+    try {
+      const existing = await first(
+        db
+          .select({ whatsappLinked: restaurants.whatsappLinked })
+          .from(restaurants)
+          .where(eq(restaurants.id, body.restaurantId))
+      );
+      wasLinked = existing?.whatsappLinked === true;
+    } catch {
+      // Best-effort — never fail the status write over a read hiccup.
+    }
+  }
+
   const status =
     body.event === "connected" ? "connected" : body.event === "qr_ready" ? "waiting" : "disconnected";
   const linked =
@@ -53,6 +77,20 @@ export async function POST(req: Request) {
         instagramUsername: body.username ?? undefined,
       })
       .where(eq(restaurants.id, body.restaurantId));
+  }
+
+  // Fire-and-forget (never blocks the status write): tell the owner a fresh QR
+  // must be scanned to bring the bot back. Guarded inside sendAlert when no
+  // Telegram alert channel is configured.
+  if (
+    body.channel === "whatsapp" &&
+    body.event === "qr_ready" &&
+    wasLinked
+  ) {
+    const qrUrl = `${GATEWAY_PUBLIC_URL}/qr/${encodeURIComponent(body.restaurantId)}/whatsapp`;
+    void sendAlert(
+      `[واست] اتصال واتساب انقطع ويحتاج إعادة ربط! امسح QR جديداً خلال دقائق حتى يرجع الرد الآلي:\n${qrUrl}`
+    ).catch(() => {});
   }
 
   return NextResponse.json({ ok: true });
