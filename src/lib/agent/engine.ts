@@ -18,12 +18,20 @@ import {
   completeWithFallback,
   estimateCostUsd,
   getAgentModel,
-  getProvider,
   getWhisperClient,
   isAIConfigured,
   TRANSCRIBE_MODEL,
   type KeyLabel,
 } from "@/lib/ai/client";
+import {
+  condenseMessages,
+  parseOrderBlock,
+  renderContextBlock,
+  stripOrderBlock,
+  ORDER_STATE_CLOSE,
+  ORDER_STATE_OPEN,
+  type CondensedContext,
+} from "./summary";
 
 export type Channel = "whatsapp" | "instagram";
 export type IncomingContentType = "text" | "image" | "voice" | "video";
@@ -88,20 +96,24 @@ const HISTORY_LIMIT = 24;
 
 // Reliability budgets (ms). The whole handler must finish well inside the
 // Vercel webhook ceiling (60s) or the gateway gets NOTHING → customer sees no
-// reply. Every LLM call is bounded individually and the handler tracks one
-// overall deadline. These are deliberately below the gateway's own 55s
-// platform call timeout so the gateway always gets a reply (or aborts) BEFORE
-// the lambda is killed — never a silent gap.
+// reply. Budgets are deliberately below the gateway's own 55s platform timeout
+// so the gateway always gets a reply (or aborts) BEFORE the lambda is killed.
+// The engine makes exactly ONE LLM call per turn, so a single budget suffices.
 const REPLY_BUDGET_MS = 12_000;
-const SIDE_BUDGET_MS = 4_000;
-// Order side-calls (menu classifier + extractor) run the SAME reasoning model
-// as the main reply, which often needs ~10s wall-clock. With a 4s budget they
-// timeout, sendMenuImages flips true, and canExtract is disabled — confirmed
-// orders then never reach Telegram. The budget above covers a reasoning call;
-// it stays bounded by the 35s handler deadline + 60s function budget.
-const ORDER_SIDE_BUDGET_MS = 10_000;
 const TRANSCRIBE_TIMEOUT_MS = 10_000;
-const HANDLER_DEADLINE_MS = 35_000;
+
+// The order-state contract appended to every call. The ONE reply of the turn
+// doubles as the order extractor: when the model updates/closes an order it
+// appends a self-describing block. The next turn's context re-condenses that
+// block without any extra LLM call — model-agnostic, minimal tokens.
+const ORDER_CONTRACT = `\n\n[إجراء إلزامي في نهاية ردك]
+عندما تُحدِّث أو تُكمل طلباً للزبون (أصناف أو كميات أو هاتف أو عنوان)، أضف في نهاية ردك — في سطر مستقل غير موجَّه للزبون — الكتلة التالية حرفياً:
+${ORDER_STATE_OPEN}{"items":[{"name":"اسم الصنف","qty":1,"price":3.5}],"total":3.5,"phone":"07701234567","address":"العنوان","customerName":"الاسم","ready":true}${ORDER_STATE_CLOSE}
+القيود الصارمة:
+- استخدم أسعار المنيو أعلاه حرفياً؛ إن جهلت الثمن فاجعل price=0.
+- ready=true فقط إذا توفَّرت الأصناف ورقم الهاتف معاً (وإن توفر العنوان احفظه أيضاً).
+- في كل تحديث للطلب أعد كتابة الكتلة بالحالة الكاملة (لا تلخص جزئياً).
+- إن لم تكن المحادثة عن طلب جارٍ فلا تكتب الكتلة إطلاقاً.`;
 
 // Graceful Iraqi-dialect fallback for a confirmed customer-facing error. The
 // CUSTOMER must see this instead of silence or a raw technical string.
@@ -370,52 +382,21 @@ async function transcribeVoice(input: IncomingMessageInput): Promise<string | nu
   }
 }
 
-function toHistory(rows: { direction: string; text: string | null }[]): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
-  const history: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
-  for (const row of rows) {
-    if (!row.text) continue;
-    history.push(
-      row.direction === "in"
-        ? { role: "user", content: row.text }
-        : { role: "assistant", content: row.text }
-    );
-  }
-  return history;
-}
-
 async function buildMessages(
   profile: BusinessProfile,
-  conversationId: string,
   input: IncomingMessageInput,
+  context: CondensedContext,
   menuNote?: string
 ): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam[]> {
-  // History is a NICETY, not a hard dependency. If the DB hiccups here, reply
-  // from the current message only — never throw (a throw lands in the AI catch
-  // and the customer gets the "try again" apology even though the AI works).
-  let historyRows: { direction: string; text: string | null }[] = [];
-  try {
-    historyRows = await db
-      .select({ direction: messages.direction, text: messages.text })
-      .from(messages)
-      .where(eq(messages.conversationId, conversationId))
-      .orderBy(desc(messages.createdAt))
-      .limit(HISTORY_LIMIT);
-  } catch (err) {
-    console.error("[ENGINE] history fetch failed — replying with current message only", err);
-  }
-
-  // Oldest → newest. The last element is the just-stored *incoming* message
-  // (stored by this turn in handleIncomingMessage before buildMessages runs).
-  // We drop it from the assistant history so the current user message is NOT
-  // duplicated — otherwise the model sees the same input twice back-to-back,
-  // which garbles role alternation and skews the reply/dialect.
-  const history = historyRows.reverse();
-  history.pop();
-  const historyMessages = toHistory(history);
-
+  // ONE request per turn: the current message + a compact deterministic
+  // summary of everything before it. Never resend the raw log in every call —
+  // that choked slow/free models (multi-request turns) and quadrupled tokens.
   const systemPrompt =
     (profile.config.systemPrompt || buildSystemPrompt(profile)) +
-    (menuNote ? `\n\n${menuNote}` : "");
+    ORDER_CONTRACT +
+    (menuNote ? `\n\n${menuNote}` : "") +
+    `\n\n${renderContextBlock(context)}`;
+
   const currentUserText = input.text ?? "";
 
   let content: OpenAI.Chat.Completions.ChatCompletionUserMessageParam["content"] =
@@ -442,7 +423,6 @@ async function buildMessages(
 
   return [
     { role: "system", content: systemPrompt },
-    ...historyMessages,
     { role: "user", content },
   ];
 }
@@ -462,25 +442,6 @@ const ORDER_INTENT =
 // a phone number in the recent exchange) the Telegram push must still fire.
 const ORDER_CONFIRM = /تمام|نعم|اكيد|أكيد|موافق|زين|هيه|yes|\bok\b/i;
 
-const ORDER_CONTEXT = /شاورما|برجر|باستا|بيزا|كبس|مندي|عدس|سل[ةط]|كولا|عصير|مشروب|فط[وو]|عشا|بيض|لحم|دجاج|مشاوي|صفيحة|كباب|شيش|\d{7,15}/;
-
-async function hasOrderIntent(conversationId: string, text: string): Promise<boolean> {
-  if (ORDER_INTENT.test(text)) return true;
-  if (!ORDER_CONFIRM.test(text)) return false;
-  const recent = await db
-    .select({ text: messages.text })
-    .from(messages)
-    .where(
-      and(
-        eq(messages.conversationId, conversationId),
-        sql`${messages.text} is not null`
-      )
-    )
-    .orderBy(desc(messages.createdAt))
-    .limit(10);
-  return recent.some((m) => m.text && ORDER_CONTEXT.test(m.text));
-}
-
 export interface RunResult {
   replyText: string;
   /** true when the turn deliberately requires NO customer reply (human
@@ -496,147 +457,6 @@ export interface RunResult {
     phone: string | null;
     address: string | null;
   }>;
-}
-
-/** Lenient JSON recovery: accepts bare JSON, code-fenced JSON, and JSON buried
- * in prose (reasoning models rarely emit an isolated code block on demand).
- * Returns null when nothing parseable exists. */
-function parseJsonSafe(raw: string): unknown | null {
-  if (!raw || !raw.trim()) return null;
-  const s = raw.trim().replace(/^```[a-z]*\s*/i, "").replace(/\s*```/i, "").trim();
-  try {
-    return JSON.parse(s);
-  } catch {
-    // fall through
-  }
-  const firstBrace = s.indexOf("{");
-  const lastBrace = s.lastIndexOf("}");
-  if (firstBrace >= 0 && lastBrace > firstBrace) {
-    try {
-      return JSON.parse(s.slice(firstBrace, lastBrace + 1));
-    } catch {
-      // fall through
-    }
-  }
-  return null;
-}
-
-async function extractOrder(
-  profile: BusinessProfile,
-  conversationId: string
-): Promise<AgentOrderResult | null> {
-  const historyRows = await db
-    .select({ direction: messages.direction, text: messages.text })
-    .from(messages)
-    .where(eq(messages.conversationId, conversationId))
-    .orderBy(desc(messages.createdAt))
-    .limit(30);
-  const historyMessages = toHistory(historyRows.reverse());
-
-  const payload = JSON.stringify({
-    ready: false,
-    items: [],
-    total: null,
-    phone: null,
-    address: null,
-    customerName: null,
-  });
-
-  try {
-    const res = await completeWithFallback(
-      {
-        model: getAgentModel(),
-        temperature: 0,
-        // The free reasoning model spends its output budget on "thinking"
-        // first; at 650 tokens reasoning consumed everything and content came
-        // back empty (proven on OpenRouter: out=650 everything=reasoning).
-        // 1500 leaves room for reasoning + the actual JSON.
-        max_tokens: 1500,
-        response_format: getProvider() === "openrouter" ? undefined : { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content: [
-              `You extract order details from a restaurant customer conversation.`,
-              `Only set "ready" to true when items AND the customer's phone are confirmed.`,
-              `Return strictly this JSON shape: ${payload}`,
-              `"items" is an array of {name: string, qty: number, price: number}. Use the menu prices above; if unsure, keep the products the customer agreed on and price=0.`,
-              `"total" is the sum. "phone" and "address" may be null if not mentioned.`,
-              `Do not wrap the JSON in prose or markdown.`,
-            ].join("\n"),
-          },
-          ...historyMessages,
-        ],
-      },
-      { budgetMs: ORDER_SIDE_BUDGET_MS, timeoutMs: ORDER_SIDE_BUDGET_MS + 2_000 }
-    );
-    const raw = res.choices[0]?.message?.content ?? "";
-    const parsed = parseJsonSafe(raw) as AgentOrderResult | null;
-    if (!parsed) {
-      await insertErrorBestEffort(
-        profile.restaurant.id,
-        "telegram",
-        "extractOrder: unparseable AI output",
-        new Error(`raw(excerpt)=${String(raw).slice(0, 300)}`)
-      );
-    }
-    return parsed && typeof parsed === "object" ? parsed : null;
-  } catch (err) {
-    await insertErrorBestEffort(
-      profile.restaurant.id,
-      "telegram",
-      "extractOrder: LLM call failed",
-      err
-    );
-    return null;
-  }
-}
-
-async function isOrderMessage(
-  profile: BusinessProfile,
-  conversationId: string,
-  currentText: string
-): Promise<boolean> {
-  const trimmed = currentText.trim();
-  if (!trimmed) return false;
-
-  const historyRows = await db
-    .select({ direction: messages.direction, text: messages.text })
-    .from(messages)
-    .where(eq(messages.conversationId, conversationId))
-    .orderBy(desc(messages.createdAt))
-    .limit(14);
-  const historyMessages = toHistory(historyRows.reverse()).slice(-10);
-
-  try {
-    const res = await completeWithFallback(
-      {
-        model: getAgentModel(),
-        temperature: 0,
-        max_tokens: 1500,
-        response_format: getProvider() === "openrouter" ? undefined : { type: "json_object" },
-        messages: [
-          {
-            role: "system",
-            content: [
-              `You classify a restaurant customer's latest message.`,
-              `"isOrder": true only when the customer is requesting to PURCHASE/ORDER food items now (e.g. "أريد 2 شاورما", "أبغى برغر كبير", "اطلب لي كولا", "نعم أريد أن أطلب").`,
-              `"isOrder": false for questions and small talk (e.g. "مرحبا", "عندكم منيو؟", "كم سعر الشاورما؟", "وش تعملون؟").`,
-              `Reply only with JSON: {"isOrder": true or false}.`,
-            ].join("\n"),
-          },
-          ...historyMessages,
-          { role: "user", content: trimmed },
-        ],
-      },
-      { budgetMs: ORDER_SIDE_BUDGET_MS, timeoutMs: ORDER_SIDE_BUDGET_MS + 2_000 }
-    );
-    const raw = res.choices[0]?.message?.content ?? "";
-    const parsed = parseJsonSafe(raw) as { isOrder?: boolean } | null;
-    return parsed?.isOrder === true;
-  } catch {
-    return false;
-  }
 }
 
 /** Best-effort error log: a DB failure while writing the log itself must
@@ -766,12 +586,35 @@ async function runIncomingMessage(
   }
 
   const hasAI = isAIConfigured();
-  const deadline = Date.now() + HANDLER_DEADLINE_MS;
   let replyText = "";
   let costUsd = 0;
   const usedModel = getAgentModel();
   let usedKeyLabel: KeyLabel | undefined;
-  let extractPromise: Promise<AgentOrderResult | null> | null = null;
+
+  // ONE cheap deterministic read of the recent log. It feeds (a) the compact
+  // "conversation so far" context and (b) the order-intent gate — there is no
+  // separate LLM classifier nor extractor, so a turn is exactly ONE request.
+  let historyRows: { direction: string; text: string | null }[] = [];
+  try {
+    historyRows = await db
+      .select({ direction: messages.direction, text: messages.text })
+      .from(messages)
+      .where(eq(messages.conversationId, conversation.id))
+      .orderBy(desc(messages.createdAt))
+      .limit(HISTORY_LIMIT);
+  } catch (err) {
+    // A DB hiccup must not break the turn — reply from the current message.
+    console.error("[ENGINE] history fetch failed — replying with current message only", err);
+  }
+  // Oldest → newest; drop the just-stored current message so it isn't seen
+  // twice (it is sent as the live user message below).
+  historyRows.reverse();
+  historyRows.pop();
+  const context = condenseMessages(historyRows);
+
+  const orderIntent =
+    ORDER_INTENT.test(effectiveText) ||
+    (ORDER_CONFIRM.test(effectiveText) && context.hasOrderMaterial);
 
   let sendMenuImages = false;
   const rawMenuImages = parseMenuImages(profile.restaurant.menuImages);
@@ -779,7 +622,13 @@ async function runIncomingMessage(
     input.channel === "whatsapp"
       ? profile.restaurant.autoMenuWhatsapp
       : profile.restaurant.autoMenuInstagram;
-  if (menuToggle && rawMenuImages.length > 0 && hasAI) {
+  if (
+    menuToggle &&
+    rawMenuImages.length > 0 &&
+    hasAI &&
+    effectiveText.trim() !== "" &&
+    !orderIntent
+  ) {
     let alreadySentMenu = false;
     try {
       const lastOut = await first(
@@ -801,41 +650,18 @@ async function runIncomingMessage(
       // pictures go out twice.
       await insertErrorBestEffort(input.restaurantId, "agent", "menu history read failed", err);
     }
-    if (!alreadySentMenu && effectiveText.trim() !== "") {
-      // Bounded classifier — never blocks the reply beyond a few seconds even
-      // if the AI is slow or on quota.
-      const isOrder = await withDeadline(
-        isOrderMessage(profile, conversation.id, effectiveText),
-        Math.min(SIDE_BUDGET_MS, Math.max(0, deadline - Date.now()))
-      ).catch(() => null);
-      step("isOrderMessage");
-      sendMenuImages = isOrder !== true;
-    }
+    sendMenuImages = !alreadySentMenu;
   }
 
   if (!hasAI || effectiveText.trim() === "") {
     replyText =
       "عذراً، أني ما قدرت أعالج رسالتك. ترجع ترسلها مرة ثانية؟ 😊";
   } else {
-    // extractOrder is a third LLM call of a turn: run it in parallel with the
-    // main reply (both only read history) so a real order still fits inside
-    // the 60s function budget. Skip it when the menu classifier already ruled
-    // out an order, the human is handling the chat, OR the text is a casual
-    // greeting that clearly holds no order (saves quota on the free tier).
-    const orderHint =
-      (await hasOrderIntent(conversation.id, effectiveText)) ||
-      input.contentType === "voice" ||
-      input.contentType === "image";
-    const canExtract =
-      conversation.status !== "manual" && orderHint;
-    extractPromise = canExtract
-      ? extractOrder(profile, conversation.id).catch(() => null)
-      : null;
     try {
       const messagesList = await buildMessages(
         profile,
-        conversation.id,
         input,
+        context,
         sendMenuImages
           ? `Note for THIS reply only: you will also send the customer the menu pictures along with your text. Acknowledge in one short line that you are sending the menu, and do NOT repeat the whole menu in text.`
           : undefined
@@ -894,7 +720,33 @@ async function runIncomingMessage(
     }
   }
 
-  if (replyText) {
+  // The reply may carry one self-describing [ORDER_STATE] block: strip it from
+  // the customer-facing text, but KEEP it in the stored log so the next turn
+  // re-condenses it into the context without any extra LLM call.
+  const rawReply = replyText;
+  const parsedOrder = parseOrderBlock(rawReply);
+  const cleanReply = stripOrderBlock(rawReply).trim();
+  if (cleanReply) replyText = cleanReply;
+
+  // Deterministic fallback: if the model wrote no block but this turn clearly
+  // continues a stocked order (explicit intent + prior items + phone), close
+  // it — the Telegram push must never depend on the model remembering format.
+  const order: AgentOrderResult | null =
+    parsedOrder ??
+    (orderIntent && context.hasOrderMaterial && context.items.length > 0 && context.phone
+      ? {
+          ready: true,
+          items: context.items,
+          total:
+            context.total ??
+            context.items.reduce((s, i) => s + i.qty * i.price, 0),
+          phone: context.phone,
+          address: context.address,
+          customerName: context.customerName,
+        }
+      : null);
+
+  if (rawReply && rawReply.trim() !== "") {
     try {
       await db
         .insert(messages)
@@ -903,7 +755,7 @@ async function runIncomingMessage(
           conversationId: conversation.id,
           direction: "out",
           contentType: "text",
-          text: replyText,
+          text: rawReply,
           status: "sent",
         });
     } catch (err) {
@@ -959,18 +811,18 @@ async function runIncomingMessage(
     };
   }
 
-  // Ride the parallel extraction (launched alongside the main reply). Manually
-  // handled conversations return early above and never reach this point. The
-  // wait is bounded by the handler deadline so extraction can never push the
-  // webhook past its Vercel budget — the customer reply already succeeded.
-  const order = extractPromise
-    ? await withDeadline(
-        extractPromise,
-        Math.min(ORDER_SIDE_BUDGET_MS, Math.max(0, deadline - Date.now()))
-      ).catch(() => null)
-    : null;
-  step("extractOrder");
-  if (order && order.ready) {
+  // Push the confirmed order (date + order + address) to the restaurant's
+  // Telegram bot, and log it so any user who messages the bot can read it.
+  // status flips to order_pending HERE, so later turns can never double-push
+  // the same order (the block/synthetic extraction stays in the log).
+  // Runs under `after()` (post-response) so it gets the route's full 60s
+  // maxDuration instead of the shrinking handler deadline — a slow/cold DB
+  // insert previously left deliveries stranded with no Telegram message and
+  // no log. Failures are logged (see notifyTelegramOrder) and re-logged here.
+  // The callback MUST return the awaited promise: an un-awaited floating
+  // promise lets Next consider `after` done instantly and the lambda is torn
+  // down before the insert+send completes.
+  if (order && order.ready && conversation.status !== "order_pending") {
     try {
       await db
         .update(conversations)
@@ -979,15 +831,6 @@ async function runIncomingMessage(
     } catch (err) {
       await insertErrorBestEffort(input.restaurantId, "agent", "order status update failed", err);
     }
-    // Push the confirmed order (date + order + address) to the restaurant's
-    // Telegram bot, and log it so any user who messages the bot can read it.
-    // Runs under `after()` (post-response) so it gets the route's full 60s
-    // maxDuration instead of the shrinking handler deadline — a slow/cold DB
-    // insert previously left deliveries stranded with no Telegram message and
-    // no log. Failures are logged (see notifyTelegramOrder) and re-logged here.
-    // The callback MUST return the awaited promise: an un-awaited floating
-    // promise lets Next consider `after` done instantly and the lambda is torn
-    // down before the insert+send completes.
     after(async () => {
       try {
         await withDeadline(notifyTelegramOrder(input.restaurantId, order), 20_000);
