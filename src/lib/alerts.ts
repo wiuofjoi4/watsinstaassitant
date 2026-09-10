@@ -2,19 +2,30 @@
 // Spend-budget alerts.
 // usage_logs already records every LLM call (model, tokens, estimated cost).
 // This module periodically sums the day/month totals and, when they cross a NEW
-// 10% bracket of a configured limit, POSTs a short warning to a Discord or
-// Slack incoming webhook so an unexpected bill can't creep up silently.
-// Everything here is best-effort and non-blocking: a failing webhook or a bad
+// 10% bracket of a configured limit, sends a short warning so an unexpected
+// bill can't creep up silently.
+// Channels (first one configured wins):
+//   - Telegram: ALERT_TELEGRAM_BOT_TOKEN + ALERT_TELEGRAM_CHAT_ID (dedicated
+//     alert bot — never reuses the per-restaurant order bots).
+//   - Generic webhook: ALERT_WEBHOOK_URL (Discord {content} / Slack {text}).
+// Everything here is best-effort and non-blocking: a failing channel or a bad
 // DB read must NEVER delay or fail the customer's reply.
 // ---------------------------------------------------------------------------
 
 import { eq, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { restaurants, usageLogs } from "@/lib/db/schema";
+import { escapeHtml, sendTelegramMessage } from "@/lib/telegram";
 
 const ALERT_URL = process.env.ALERT_WEBHOOK_URL ?? "";
+const TG_TOKEN = process.env.ALERT_TELEGRAM_BOT_TOKEN ?? "";
+const TG_CHAT_ID = process.env.ALERT_TELEGRAM_CHAT_ID ?? "";
 const DAILY_LIMIT = Number(process.env.DAILY_SPEND_LIMIT_USD ?? 0);
 const MONTHLY_LIMIT = Number(process.env.MONTHLY_SPEND_LIMIT_USD ?? 0);
+
+function hasAlertChannel(): boolean {
+  return (TG_TOKEN !== "" && TG_CHAT_ID !== "") || ALERT_URL !== "";
+}
 
 // One DB sum per 5 minutes, shared across the whole process. Loose by design:
 // the alert is a heads-up, not a real-time meter.
@@ -27,14 +38,25 @@ let inflight: Promise<void> | null = null;
 const alertedBrackets = new Set<string>();
 
 export async function sendAlert(text: string): Promise<void> {
-  if (!ALERT_URL) return;
-  const isSlack = /slack/i.test(ALERT_URL);
-  const body = isSlack ? { text } : { content: text };
+  if (!hasAlertChannel()) return;
   try {
+    // Telegram is HTML-parse_mode — escape anything that could look like a tag.
+    const tgText = escapeHtml(text);
+    const sent =
+      TG_TOKEN !== "" && TG_CHAT_ID !== ""
+        ? await sendTelegramMessage(TG_TOKEN, TG_CHAT_ID, tgText, 10_000)
+        : null;
+    if (sent === true) return;
+    if (sent === false) {
+      console.error("[ALERT] telegram send returned false");
+      return;
+    }
+    // Fall through to the generic webhook when no Telegram channel is set.
+    const isSlack = /slack/i.test(ALERT_URL);
     const res = await fetch(ALERT_URL, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify(isSlack ? { text: tgText } : { content: tgText }),
       signal: AbortSignal.timeout(6_000),
     });
     if (!res.ok) {
@@ -44,7 +66,7 @@ export async function sendAlert(text: string): Promise<void> {
     }
   } catch (err) {
     console.error(
-      `[ALERT] webhook error: ${err instanceof Error ? err.message : String(err)}`
+      `[ALERT] send error: ${err instanceof Error ? err.message : String(err)}`
     );
   }
 }
@@ -73,7 +95,7 @@ async function topSpendersToday(): Promise<string[]> {
     .groupBy(restaurants.id, restaurants.name)
     .orderBy(sql`coalesce(sum(${usageLogs.costUsd}), 0) desc`)
     .limit(3);
-  return rows.map((r) => `${r.name}: $${r.total.toFixed(2)}`);
+  return rows.map((r) => `${escapeHtml(r.name)}: $${r.total.toFixed(2)}`);
 }
 
 /**
@@ -81,7 +103,7 @@ async function topSpendersToday(): Promise<string[]> {
  * fire-and-forget from the reply path — it never blocks or throws outward.
  */
 export async function maybeCheckSpendBudget(): Promise<void> {
-  if (ALERT_URL === "" || (DAILY_LIMIT <= 0 && MONTHLY_LIMIT <= 0)) return;
+  if (!hasAlertChannel() || (DAILY_LIMIT <= 0 && MONTHLY_LIMIT <= 0)) return;
   const now = Date.now();
   if (now - lastCheckAt < CHECK_INTERVAL_MS) return;
   if (inflight) return inflight;

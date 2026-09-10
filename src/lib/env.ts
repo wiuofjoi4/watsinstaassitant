@@ -71,12 +71,18 @@ export function logEnvBanner(): void {
 
   // Spend alerts.
   const alertUrl = process.env.ALERT_WEBHOOK_URL ?? "";
+  const tgToken = (process.env.ALERT_TELEGRAM_BOT_TOKEN ?? "").trim();
+  const tgChat = (process.env.ALERT_TELEGRAM_CHAT_ID ?? "").trim();
+  const alertChannel =
+    tgToken && tgChat ? "telegram" : alertUrl ? "webhook" : "";
   const daily = Number(process.env.DAILY_SPEND_LIMIT_USD ?? 0);
   const monthly = Number(process.env.MONTHLY_SPEND_LIMIT_USD ?? 0);
   out.push(
-    alertUrl
-      ? `[ENV] Spend alert webhook ...... configured (daily=${daily || "off"} monthly=${monthly || "off"})`
-      : `[ENV] Spend alert webhook ...... disabled (set ALERT_WEBHOOK_URL)`
+    alertChannel
+      ? `[ENV] Spend alert channel ...... ${alertChannel} (daily=${
+          daily || "off"
+        } monthly=${monthly || "off"})`
+      : `[ENV] Spend alert channel ...... disabled (set ALERT_TELEGRAM_BOT_TOKEN + ALERT_TELEGRAM_CHAT_ID or ALERT_WEBHOOK_URL)`
   );
 
   // Database.
