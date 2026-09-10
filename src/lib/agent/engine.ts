@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { after } from "next/server";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, gte, sql } from "drizzle-orm";
 import { db } from "@/lib/db";
 import {
   agentConfigs,
@@ -8,6 +8,7 @@ import {
   errorLogs,
   messages,
   restaurants,
+  telegramOrderDeliveries,
   usageLogs,
 } from "@/lib/db/schema";
 import { newId } from "@/lib/utils";
@@ -56,6 +57,43 @@ export interface AgentOrderResult {
   phone?: string | null;
   address?: string | null;
   customerName?: string | null;
+}
+
+function normalizeItems(
+  items: AgentOrderResult["items"]
+): { name: string; qty: number; price: number }[] {
+  return (Array.isArray(items) ? items : [])
+    .map((i) => ({
+      name: String(i.name ?? ""),
+      qty: Number(i.qty) || 1,
+      price: Number(i.price) || 0,
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name) || a.qty - b.qty);
+}
+
+function orderFingerprint(order: AgentOrderResult): string {
+  return `${order.phone ?? ""}|${Number(order.total) || 0}|${JSON.stringify(
+    normalizeItems(order.items)
+  )}`;
+}
+
+/** True when a stored push matches this order (phone + total + items), so a
+ * redundant model re-echo of the SAME order isn't pushed twice. */
+function sameFingerprint(
+  itemsJson: string,
+  storedTotal: number | null,
+  order: AgentOrderResult
+): boolean {
+  let stored: { name: string; qty: number; price: number }[] = [];
+  try {
+    stored = normalizeItems(JSON.parse(itemsJson));
+  } catch {
+    return false;
+  }
+  const sameItems = JSON.stringify(stored) === JSON.stringify(normalizeItems(order.items));
+  const sameTotal =
+    (!Number(order.total) && !storedTotal) || Number(storedTotal) === Number(order.total);
+  return sameItems && sameTotal;
 }
 
 export interface AgentReply {
@@ -811,33 +849,72 @@ async function runIncomingMessage(
     };
   }
 
-  // Push the confirmed order (date + order + address) to the restaurant's
+  // Push every CONFIRMED order (date + order + address) to the restaurant's
   // Telegram bot, and log it so any user who messages the bot can read it.
-  // status flips to order_pending HERE, so later turns can never double-push
-  // the same order (the block/synthetic extraction stays in the log).
-  // Runs under `after()` (post-response) so it gets the route's full 60s
-  // maxDuration instead of the shrinking handler deadline — a slow/cold DB
-  // insert previously left deliveries stranded with no Telegram message and
-  // no log. Failures are logged (see notifyTelegramOrder) and re-logged here.
+  // There is deliberately NO once-per-conversation gate: a returning customer's
+  // NEXT order must also reach Telegram (the old status == order_pending guard
+  // silently swallowed every later order from the same customer). Re-echo
+  // protection instead dedups against the most recent push — same restaurant + 
+  // phone + total + items within 5 minutes — because some models re-emit the
+  // [ORDER_STATE] block on no-op turns, which would otherwise spam Telegram
+  // with the same order twice. Runs under `after()` (post-response) so it gets
+  // the route's full 60s maxDuration instead of the shrinking handler deadline.
   // The callback MUST return the awaited promise: an un-awaited floating
   // promise lets Next consider `after` done instantly and the lambda is torn
   // down before the insert+send completes.
-  if (order && order.ready && conversation.status !== "order_pending") {
+  if (order && order.ready) {
+    const fingerprint = orderFingerprint(order);
+    let duplicate = false;
     try {
-      await db
-        .update(conversations)
-        .set({ status: "order_pending" })
-        .where(eq(conversations.id, conversation.id));
+      const cutoff = new Date(Date.now() - 5 * 60_000);
+      const recent = await db
+        .select({
+          total: telegramOrderDeliveries.total,
+          itemsJson: telegramOrderDeliveries.itemsJson,
+        })
+        .from(telegramOrderDeliveries)
+        .where(
+          and(
+            eq(telegramOrderDeliveries.restaurantId, input.restaurantId),
+            order.phone
+              ? eq(telegramOrderDeliveries.phone, order.phone)
+              : undefined,
+            gte(telegramOrderDeliveries.requestedAt, cutoff)
+          )
+        )
+        .orderBy(desc(telegramOrderDeliveries.requestedAt))
+        .limit(3);
+      duplicate = recent.some(
+        (r) => r.itemsJson && sameFingerprint(r.itemsJson, r.total, order)
+      );
     } catch (err) {
-      await insertErrorBestEffort(input.restaurantId, "agent", "order status update failed", err);
+      // A dedup probe must never block the push — better a rare duplicate than
+      // a swallowed confirmed order.
+      await insertErrorBestEffort(input.restaurantId, "telegram", "order dedup probe failed", err);
     }
-    after(async () => {
+    if (duplicate) {
+      await insertErrorBestEffort(
+        input.restaurantId,
+        "telegram",
+        `duplicate order push skipped (${fingerprint})`
+      );
+    } else {
       try {
-        await withDeadline(notifyTelegramOrder(input.restaurantId, order), 20_000);
+        await db
+          .update(conversations)
+          .set({ status: "order_pending" })
+          .where(eq(conversations.id, conversation.id));
       } catch (err) {
-        await insertErrorBestEffort(input.restaurantId, "telegram", "notifyTelegramOrder failed", err);
+        await insertErrorBestEffort(input.restaurantId, "agent", "order status update failed", err);
       }
-    });
+      after(async () => {
+        try {
+          await withDeadline(notifyTelegramOrder(input.restaurantId, order), 20_000);
+        } catch (err) {
+          await insertErrorBestEffort(input.restaurantId, "telegram", "notifyTelegramOrder failed", err);
+        }
+      });
+    }
   }
 
   // Structured outcome log — lets ops diagnose intermittent failures from logs
