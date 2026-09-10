@@ -248,6 +248,10 @@ async function startSession(restaurantId: string): Promise<void> {
       auth: auth.state,
       browser: Browsers.ubuntu("Chrome"),
       syncFullHistory: false,
+      // Keep the device line flagged ONLINE on WhatsApp's servers the moment the
+      // socket opens — an apparently-dormant device is exactly what triggers
+      // server-side session invalidation and a forced QR re-pair.
+      markOnlineOnConnect: true,
     });
   } catch (err) {
     logger.error(`makeWASocket threw for ${restaurantId}: ${String(err)}`);
