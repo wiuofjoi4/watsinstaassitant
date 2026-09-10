@@ -119,19 +119,19 @@ export function composeOrderText(
   }
 ): string {
   const lines: string[] = [];
-  lines.push(`📦 <b>طلب جديد — ${escapeHtml(restaurantName)}</b>`);
-  lines.push(`🕒 التاريخ: ${escapeHtml(formatOrderDateTime(requestedAt))}`);
+  lines.push(`<b>طلب جديد — ${escapeHtml(restaurantName)}</b>`);
+  lines.push(`التاريخ: ${escapeHtml(formatOrderDateTime(requestedAt))}`);
   if (order.customerName) {
-    lines.push(`👤 الاسم: ${escapeHtml(order.customerName)}`);
+    lines.push(`الاسم: ${escapeHtml(order.customerName)}`);
   }
   if (order.phone) {
-    lines.push(`📞 الهاتف: ${escapeHtml(order.phone)}`);
+    lines.push(`الهاتف: ${escapeHtml(order.phone)}`);
   }
   if (order.address) {
-    lines.push(`🏠 العنوان: ${escapeHtml(order.address)}`);
+    lines.push(`العنوان: ${escapeHtml(order.address)}`);
   }
   lines.push("");
-  lines.push("🛒 <b>الطلب</b>");
+  lines.push(`<b>الطلب</b>`);
   const items = Array.isArray(order.items) ? order.items : [];
   for (const item of items) {
     const qty = Number(item.qty) || 1;
@@ -145,7 +145,7 @@ export function composeOrderText(
   const total = Number(order.total);
   if (total > 0) {
     lines.push("");
-    lines.push(`💰 <b>الإجمالي: ${total.toFixed(2)}</b>`);
+    lines.push(`<b>الإجمالي: ${total.toFixed(2)}</b>`);
   }
   return lines.join("\n");
 }
@@ -155,21 +155,21 @@ export function renderTelegramOrders(
   rows: TelegramOrderDelivery[]
 ): string {
   if (rows.length === 0) {
-    return `📋 <b>${escapeHtml(restaurantName)}</b>\nلا توجد طلبات مؤكدة بعد.`;
+    return `<b>${escapeHtml(restaurantName)}</b>\nلا توجد طلبات مؤكدة بعد.`;
   }
   const parts: string[] = [
-    `📋 <b>${escapeHtml(restaurantName)} — الطلبات المؤكدة</b>`,
+    `<b>${escapeHtml(restaurantName)} — الطلبات المؤكدة</b>`,
     `أحدث ${rows.length} طلب(طلبات):`,
     "",
   ];
   rows.forEach((row, i) => {
     parts.push(`<b>${i + 1}) تاريخ الطلب:</b> ${escapeHtml(formatOrderDateTime(row.requestedAt))}`);
-    if (row.customerName) parts.push(`👤 الاسم: ${escapeHtml(row.customerName)}`);
-    if (row.phone) parts.push(`📞 الهاتف: ${escapeHtml(row.phone)}`);
-    if (row.address) parts.push(`🏠 العنوان: ${escapeHtml(row.address)}`);
-    parts.push(`🛒 الطلب: ${escapeHtml(row.itemsJson)}`);
+    if (row.customerName) parts.push(`الاسم: ${escapeHtml(row.customerName)}`);
+    if (row.phone) parts.push(`الهاتف: ${escapeHtml(row.phone)}`);
+    if (row.address) parts.push(`العنوان: ${escapeHtml(row.address)}`);
+    parts.push(`الطلب: ${escapeHtml(row.itemsJson)}`);
     const total = Number(row.total);
-    if (total > 0) parts.push(`💰 الإجمالي: ${total.toFixed(2)}`);
+    if (total > 0) parts.push(`الإجمالي: ${total.toFixed(2)}`);
     parts.push("");
   });
   return parts.join("\n");

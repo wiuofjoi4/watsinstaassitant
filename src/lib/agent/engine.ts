@@ -96,6 +96,28 @@ function sameFingerprint(
   return sameItems && sameTotal;
 }
 
+// WhatsApp sender JID → phone. Handles "9647xxxxxxxx@s.whatsapp.net" and the
+// LID-shaped "9647xxxxxxxx:2@s.whatsapp.net" (strip the ":instance" suffix and
+// drop non-digits). "claims" too short (<7 digits) are LID placeholders — not a
+// real phone, so return null and let the flow ask/collect normally.
+export function jidToPhone(jid: string | null | undefined): string | null {
+  if (!jid || typeof jid !== "string") return null;
+  const [local, server] = jid.split("@");
+  const sv = server ?? "";
+  // Only real user JIDs carry a phone. "lid" IDs, groups, broadcast/newsletter
+  // channels are numeric but NOT phone numbers — never treat them as one.
+  if (!["s.whatsapp.net"].includes(sv)) return null;
+  let digits = (local ?? "").split(":")[0].replace(/\D/g, "");
+  return digits.length >= 7 ? digits : null;
+}
+
+// The owner demands reply text WITHOUT emojis, so this is a hard guarantee on
+// top of the prompt instruction (models are unreliable about following it).
+const EMOJI_RE = /[\p{Extended_Pictographic}\u200d\ufe0e\ufe0f]/gu;
+export function stripEmojis(text: string): string {
+  return (text ?? "").replace(EMOJI_RE, "").replace(/\s{2,}/g, " ").trim();
+}
+
 export interface AgentReply {
   text: string;
   transcribedFromVoice?: string | null;
@@ -143,24 +165,33 @@ const TRANSCRIBE_TIMEOUT_MS = 10_000;
 // The order-state contract appended to every call. The ONE reply of the turn
 // doubles as the order extractor: when the model updates/closes an order it
 // appends a self-describing block. The next turn's context re-condenses that
-// block without any extra LLM call — model-agnostic, minimal tokens.
-const ORDER_CONTRACT = `\n\n[إجراء إلزامي في نهاية ردك]
+// block without any extra LLM call — model-agnostic, minimal tokens. The phone
+// rule differs per channel: on WhatsApp the number is auto-known (sender jid),
+// on Instagram it must be collected like before.
+function orderContract(senderPhone?: string | null): string {
+  const phoneKnown = !!senderPhone && /^\d{4,}$/.test(senderPhone);
+  return `\n\n[إجراء إلزامي في نهاية ردك]
 عندما تُحدِّث أو تُكمل طلباً للزبون (أصناف أو كميات أو هاتف أو عنوان)، أضف في نهاية ردك — في سطر مستقل غير موجَّه للزبون — الكتلة التالية حرفياً:
 ${ORDER_STATE_OPEN}{"items":[{"name":"اسم الصنف","qty":1,"price":3.5}],"total":3.5,"phone":"07701234567","address":"العنوان","customerName":"الاسم","ready":true}${ORDER_STATE_CLOSE}
 القيود الصارمة:
 - استخدم أسعار المنيو أعلاه حرفياً؛ إن جهلت الثمن فاجعل price=0.
-- ready=true فقط إذا توفَّرت الأصناف ورقم الهاتف معاً (وإن توفر العنوان احفظه أيضاً).
+${
+  phoneKnown
+    ? `- هاتف الزبون معروف تلقائياً من واتساب. ضعه في حقل phone ولا تطلب الرقم من الزبون أبداً.
+- ready=true عندما تتوفر الأصناف (الهاتف لا يُنتظر، فهو مُجلب آلياً).`
+    : `- ready=true فقط إذا توفَّرت الأصناف ورقم الهاتف معاً (وإن توفر العنوان احفظه أيضاً).`
+}
 - في كل تحديث للطلب أعد كتابة الكتلة بالحالة الكاملة (لا تلخص جزئياً).
 - إن لم تكن المحادثة عن طلب جارٍ فلا تكتب الكتلة إطلاقاً.`;
+}
 
-// Graceful Iraqi-dialect fallback for a confirmed customer-facing error. The
-// CUSTOMER must see this instead of silence or a raw technical string.
+// Graceful formal Iraqi-dialect fallback for a confirmed customer-facing error — NO emojis.
 const GRACEFUL_FALLBACK =
-  "عذراً صار خلل بسيط، جرب مرة ثانية بعد شوي 🙏";
+  "عذراً صار خلل بسيط، جرب مرة ثانية بعد شوي.";
 // Used when the DB is unreachable — same graceful tone, distinct wording so
 // ops can tell the two apart in logs without the customer seeing anything raw.
 const DB_DOWN_REPLY =
-  "عذراً صار تعطل بسيط بالخادم، كرر رسالتك بعد دقيقة 🙏";
+  "عذراً صار تعطل بسيط بالخادم، كرر رسالتك بعد دقيقة.";
 
 // --- Per-conversation request locking (race conditioning) ---
 // Two rapid messages from the same customer can hit different Vercel lambda
@@ -424,16 +455,23 @@ async function buildMessages(
   profile: BusinessProfile,
   input: IncomingMessageInput,
   context: CondensedContext,
-  menuNote?: string
+  menuNote?: string,
+  senderPhone?: string | null
 ): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam[]> {
   // ONE request per turn: the current message + a compact deterministic
   // summary of everything before it. Never resend the raw log in every call —
   // that choked slow/free models (multi-request turns) and quadrupled tokens.
+  // Always rebuild the system prompt here (buildSystemPrompt) instead of the
+  // stored config.systemPrompt: the stored copy was frozen at save time and
+  // still carried stale instructions (ORDER_SUMMARY, ask-for-phone, emojis).
+  const effectiveContext: CondensedContext = context.phone
+    ? context
+    : { ...context, phone: senderPhone ?? null };
   const systemPrompt =
-    (profile.config.systemPrompt || buildSystemPrompt(profile)) +
-    ORDER_CONTRACT +
+    buildSystemPrompt(profile, { senderPhone }) +
+    orderContract(senderPhone) +
     (menuNote ? `\n\n${menuNote}` : "") +
-    `\n\n${renderContextBlock(context)}`;
+    `\n\n${renderContextBlock(effectiveContext)}`;
 
   const currentUserText = input.text ?? "";
 
@@ -566,7 +604,7 @@ async function runIncomingMessage(
     // gracefully so the customer isn't left hanging.
     return {
       replyText:
-        "عذراً، خدمة الطلبات متوقفة حالياً. تواصل مع المطعم مباشرة 🙏",
+        "عذراً، خدمة الطلبات متوقفة حالياً. تواصل مع المطعم مباشرة.",
       costUsd: 0,
       model: getAgentModel(),
     };
@@ -650,6 +688,17 @@ async function runIncomingMessage(
   historyRows.pop();
   const context = condenseMessages(historyRows);
 
+  // The customer's phone comes from WhatsApp itself (sender number) — never
+  // make the customer type it. If they typed a DIFFERENT number recently, that
+  // one wins; otherwise the sender's is the order's phone. Instagram only: its
+  // remoteJid is an internal user ID, NOT a phone — leave it to be asked there.
+  const senderPhone =
+    input.channel === "whatsapp" ? jidToPhone(input.remoteJid) : null;
+  const effectiveContext: CondensedContext =
+    context.phone || !senderPhone
+      ? context
+      : { ...context, phone: senderPhone };
+
   const orderIntent =
     ORDER_INTENT.test(effectiveText) ||
     (ORDER_CONFIRM.test(effectiveText) && context.hasOrderMaterial);
@@ -693,7 +742,7 @@ async function runIncomingMessage(
 
   if (!hasAI || effectiveText.trim() === "") {
     replyText =
-      "عذراً، أني ما قدرت أعالج رسالتك. ترجع ترسلها مرة ثانية؟ 😊";
+      "عذراً، أني ما قدرت أعالج رسالتك. ترجع ترسلها مرة ثانية؟";
   } else {
     try {
       const messagesList = await buildMessages(
@@ -702,7 +751,8 @@ async function runIncomingMessage(
         context,
         sendMenuImages
           ? `Note for THIS reply only: you will also send the customer the menu pictures along with your text. Acknowledge in one short line that you are sending the menu, and do NOT repeat the whole menu in text.`
-          : undefined
+          : undefined,
+        senderPhone
       );
       const res = await completeWithFallback(
         {
@@ -719,7 +769,7 @@ async function runIncomingMessage(
       // customer — never leave the gateway with an empty reply (it currently
       // treats blank text + no images as "nothing to send" → silent no-reply).
       if (!replyText) {
-        replyText = "عذراً صار خلل بسيط، جرب مرة ثانية بعد شوي 🙏";
+        replyText = GRACEFUL_FALLBACK;
       }
       const usage = res.usage;
       const inTok = usage?.prompt_tokens ?? 0;
@@ -752,8 +802,7 @@ async function runIncomingMessage(
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      replyText =
-        "عذراً صار خلل بسيط، جرب مرة ثانية بعد شوي 🙏";
+      replyText = GRACEFUL_FALLBACK;
       await insertErrorBestEffort(input.restaurantId, "agent", `model error: ${message}`, err);
     }
   }
@@ -764,25 +813,41 @@ async function runIncomingMessage(
   const rawReply = replyText;
   const parsedOrder = parseOrderBlock(rawReply);
   const cleanReply = stripOrderBlock(rawReply).trim();
-  if (cleanReply) replyText = cleanReply;
+  // Hard guarantee: no emojis reach the customer (the prompt alone is not
+  // reliable on models). If stripping empties the reply, keep the original.
+  if (cleanReply) replyText = stripEmojis(cleanReply) || cleanReply;
 
   // Deterministic fallback: if the model wrote no block but this turn clearly
-  // continues a stocked order (explicit intent + prior items + phone), close
-  // it — the Telegram push must never depend on the model remembering format.
-  const order: AgentOrderResult | null =
+  // continues a stocked order (explicit intent + prior items), close it — the
+  // Telegram push must never depend on the model remembering the format. The
+  // phone is taken from effectiveContext (auto-filled from the sender's
+  // WhatsApp number) so it can never block the order.
+  let order: AgentOrderResult | null =
     parsedOrder ??
-    (orderIntent && context.hasOrderMaterial && context.items.length > 0 && context.phone
+    (orderIntent && context.hasOrderMaterial && context.items.length > 0
       ? {
           ready: true,
           items: context.items,
           total:
             context.total ??
             context.items.reduce((s, i) => s + i.qty * i.price, 0),
-          phone: context.phone,
-          address: context.address,
-          customerName: context.customerName,
+          phone: effectiveContext.phone,
+          address: effectiveContext.address,
+          customerName: effectiveContext.customerName,
         }
       : null);
+
+  // Normalize the phone on every completed order: the sender number fills any
+  // gap (model omitted it), which also promotes a blocked order to ready. The
+  // pushed order must never be missing a contact number the owner can call.
+  if (
+    order &&
+    order.items.length > 0 &&
+    !order.phone &&
+    effectiveContext.phone
+  ) {
+    order = { ...order, phone: effectiveContext.phone, ready: true };
+  }
 
   if (rawReply && rawReply.trim() !== "") {
     try {
