@@ -222,17 +222,37 @@ async function postStatus(
 
 function ensureSession(restaurantId: string): void {
   const existing = sessions.get(restaurantId);
-  if (existing && (existing.connected || existing.qr)) return;
-  if (existing && Date.now() - existing.startedAt < 90_000) return;
-  if (existing) {
-    // Alive but stuck (e.g. restored creds hit logged-out) → drop stored creds
-    // and restart so the owner gets a fresh QR.
-    try {
-      void existing.auth.discard();
-      existing.socket.end(undefined);
-    } catch {}
-    sessions.delete(restaurantId);
+  if (!existing) {
+    void startSession(restaurantId);
+    return;
   }
+
+  // NEVER tear down an existing session from here. This is the root cause of the
+  // recurring "Scan → no reply" + "Stream Errored (conflict)" cycles and the
+  // "drops every few hours": the old guard killed any session older than 90s
+  // that wasn't connected and had no QR. But the exact moment a freshly scanned
+  // QR transitions the socket to "connecting" (qr null, not yet open), the loop
+  // discarded the stored creds and killed the socket — destroying the pairing
+  // mid-handshake → WhatsApp drops it with 440 conflict, and the owner is forced
+  // to re-scan. Long-up reconnects had the same fate.
+  //
+  // Recovery is the job of the socket's own connection.update ("close" → retry;
+  // "loggedOut" → discard + fresh QR) and of makeWASocket's catch → retry.
+  // Safety net below covers the only case those can't: a hung socket that never
+  // fired a close event (no open, no qr ever, up for 10+ min). It restarts the
+  // socket but KEEPS stored creds — a real pairing handshake finishes in
+  // seconds, so this can never hit a live pairing.
+  const hungLongWithoutPairing =
+    !existing.connected &&
+    !existing.qrOnce &&
+    Date.now() - existing.startedAt > 10 * 60_000;
+  if (!hungLongWithoutPairing) return;
+
+  logger.warn(`restarting hung socket for ${restaurantId} (no open/no qr for 10m)`);
+  try {
+    existing.socket.end(undefined);
+  } catch {}
+  sessions.delete(restaurantId);
   void startSession(restaurantId);
 }
 
