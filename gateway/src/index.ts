@@ -236,7 +236,24 @@ function ensureSession(restaurantId: string): void {
   void startSession(restaurantId);
 }
 
+// A per-restaurant mutex: startSession can be triggered from several places
+// (ensureSession's loop, the close handler's retry, the makeWASocket catch)
+// and concurrent calls create TWO sockets for the same WhatsApp device — the
+// second one gets the stream killed with "errored (conflict)" and can take the
+// whole line down. Only one creation attempt may be in flight at a time.
+const starting = new Set<string>();
+
 async function startSession(restaurantId: string): Promise<void> {
+  if (starting.has(restaurantId)) return;
+  starting.add(restaurantId);
+  try {
+    await startSessionInner(restaurantId);
+  } finally {
+    starting.delete(restaurantId);
+  }
+}
+
+async function startSessionInner(restaurantId: string): Promise<void> {
   logger.info(`starting session for ${restaurantId}`);
   const auth = new PgAuthState(restaurantId, sql);
   await auth.ready;

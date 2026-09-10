@@ -56,19 +56,25 @@ export async function POST(req: Request) {
 
   const status =
     body.event === "connected" ? "connected" : body.event === "qr_ready" ? "waiting" : "disconnected";
-  const linked =
-    body.event === "connected" ? true : body.event === "disconnected" ? false : undefined;
 
   if (body.channel === "whatsapp") {
     await db
       .update(restaurants)
       .set({
         whatsappStatus: status,
-        whatsappLinked: linked === undefined ? undefined : linked,
+        // A socket close is NOT an unlink: the device stays paired, and the
+        // gateway auto-reconnects from stored creds. Only an explicit "connected"
+        // flips linked to true; a transient drop must never clear it, or the
+        // sync loop stops wanting a session and the bot stays dead with no QR
+        // until a manual re-link. (grep: user bug "stops every few hours")
+        whatsappLinked:
+          body.event === "connected" ? true : undefined,
         whatsappJid: body.jid ?? undefined,
       })
       .where(eq(restaurants.id, body.restaurantId));
   } else {
+    const linked =
+      body.event === "connected" ? true : body.event === "disconnected" ? false : undefined;
     await db
       .update(restaurants)
       .set({
