@@ -13,6 +13,34 @@ import {
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
+// ---------------------------------------------------------------------------
+// Deduplication — in-memory, per message mid
+// Instagram (Meta) can re-deliver the same webhook within seconds. This
+// prevents double-processing. Works reliably when Vercel runs a single
+// warm instance. During cold starts or heavy concurrency, two lambda
+// instances *could* both see the same mid — the conversation lock inside
+// engine.ts is the safety net that serializes them.
+// For bullet-proof multi-instance dedup, a shared DB table would be needed.
+// ---------------------------------------------------------------------------
+const IG_DEDUP_TTL_MS = 15 * 60_000;
+const seenIgMids = new Map<string, number>();
+
+function isIgDuplicate(mid: string): boolean {
+  const now = Date.now();
+  const prev = seenIgMids.get(mid);
+  if (prev !== undefined && now - prev < IG_DEDUP_TTL_MS) return true;
+  seenIgMids.set(mid, now);
+  return false;
+}
+
+// Periodic cleanup
+setInterval(() => {
+  const cutoff = Date.now() - IG_DEDUP_TTL_MS;
+  for (const [id, ts] of seenIgMids) {
+    if (ts < cutoff) seenIgMids.delete(id);
+  }
+}, 120_000);
+
 interface MessagingEvent {
   sender: { id: string };
   recipient: { id: string };
@@ -87,6 +115,14 @@ export async function POST(req: Request) {
 
         if (!restaurant) {
           console.warn("instagram webhook: no restaurant for igId", igId);
+          continue;
+        }
+
+        // Dedup: skip if this Instagram mid was already processed recently.
+        // Prevents double AI calls and double replies from webhook retries.
+        const mid = event.message?.mid;
+        if (mid && isIgDuplicate(mid)) {
+          console.info(`instagram dedup skip mid=${mid} restaurant=${restaurant.id}`);
           continue;
         }
 

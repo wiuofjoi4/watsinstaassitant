@@ -219,6 +219,69 @@ function pruneCooldowns(now: number): void {
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // ---------------------------------------------------------------------------
+// Circuit breaker — global for the whole AI provider chain (per process /
+// lambda instance; every Vercel instance keeps its own state, so a breaker
+// can never shut down instances it doesn't hold).
+// Design is a WINDOWED FAILURE-RATIO, not a bare consecutive counter: a pure
+// "3 consecutive failures" counter would trip on 3 random unrelated timeouts
+// from 3 different restaurants at peak hours and knock out smart replies for
+// every tenant on a healthy platform. Instead we record every full-chain
+// attempt (success or failure) in a tumbling 60s window and open the breaker
+// only when the chain is failing EN MASSE — >=10 attempts in the window, >=6
+// failed, and >=75% failed. Random blips drowned in hundreds of successes
+// never trip it; a real outage (provider down or shared-key quota exhausted,
+// which by definition hits every restaurant at once) trips it within a few
+// seconds of burst traffic. While open, every new call fails fast (<1ms)
+// instead of burning the ~20s budget on a broken chain; after the cooldown
+// the chain is tried again from a fresh window.
+// ---------------------------------------------------------------------------
+const CIRCUIT_WINDOW_MS = 60_000; // window over which attempts are tallied
+const CIRCUIT_MIN_ATTEMPTS = 10; // need this many attempts before a trip is legal
+const CIRCUIT_MIN_FAILURES = 6; // ...and at least this many of them failed
+const CIRCUIT_FAIL_RATE = 0.75; // ...and at least 75% of them failed
+const CIRCUIT_COOLDOWN_MS = 60_000; // how long the breaker stays open
+let circuitWinStart = 0;
+let circuitWinTotal = 0;
+let circuitWinFailures = 0;
+let circuitOpenedAt = 0;
+
+function recordCircuitAttempt(ok: boolean, now: number): void {
+  if (circuitOpenedAt) return; // an open breaker never samples its own fast-fails
+  if (now - circuitWinStart >= CIRCUIT_WINDOW_MS) {
+    circuitWinStart = now;
+    circuitWinTotal = 0;
+    circuitWinFailures = 0;
+  }
+  circuitWinTotal++;
+  if (!ok) {
+    circuitWinFailures++;
+    if (
+      circuitWinTotal >= CIRCUIT_MIN_ATTEMPTS &&
+      circuitWinFailures >= CIRCUIT_MIN_FAILURES &&
+      circuitWinFailures / circuitWinTotal >= CIRCUIT_FAIL_RATE
+    ) {
+      circuitOpenedAt = now;
+      console.error(
+        `[CIRCUIT] opened for ${(CIRCUIT_COOLDOWN_MS / 1000).toFixed(0)}s — ` +
+          `${circuitWinFailures}/${circuitWinTotal} full-chain attempts failed`
+      );
+    }
+  }
+}
+
+function circuitShouldFailFast(now: number): boolean {
+  if (!circuitOpenedAt) return false;
+  if (now - circuitOpenedAt < CIRCUIT_COOLDOWN_MS) return true;
+  // Cooldown elapsed — close the breaker and start a fresh tally window.
+  circuitOpenedAt = 0;
+  circuitWinStart = 0;
+  circuitWinTotal = 0;
+  circuitWinFailures = 0;
+  console.error(`[CIRCUIT] closed after cooldown`);
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Available Gemini models (auto-discovered from the API)
 // ---------------------------------------------------------------------------
 
@@ -437,6 +500,12 @@ export async function completeWithFallback(
 ): Promise<
   OpenAI.Chat.Completions.ChatCompletion & { keyLabel?: string }
 > {
+  // Fail fast while the circuit breaker is open: the whole chain just failed
+  // repeatedly, so don't burn the 20s budget on retries that will fail again.
+  if (circuitShouldFailFast(Date.now())) {
+    throw new Error("AI circuit breaker open — providers failing");
+  }
+
   const budgetMs = opts?.budgetMs ?? 20_000;
   const timeoutMs = opts?.timeoutMs ?? 20_000;
   // One shared deadline across every phase so the total chain (Gemini chain +
@@ -467,6 +536,7 @@ export async function completeWithFallback(
     );
     attemptLogs.push(...(openrouterFirst.attempts ?? []));
     if (openrouterFirst.result) {
+      recordCircuitAttempt(true, Date.now());
       return Object.assign(openrouterFirst.result, {
         keyLabel: openrouterFirst.keyUsed ?? undefined,
       });
@@ -484,6 +554,7 @@ export async function completeWithFallback(
     );
     attemptLogs.push(...(first.attempts ?? []));
     if (first.result) {
+      recordCircuitAttempt(true, Date.now());
       return Object.assign(first.result, { keyLabel: first.keyUsed ?? undefined });
     }
 
@@ -506,6 +577,7 @@ export async function completeWithFallback(
     );
     attemptLogs.push(...(second.attempts ?? []));
     if (second.result) {
+      recordCircuitAttempt(true, Date.now());
       return Object.assign(second.result, { keyLabel: second.keyUsed ?? undefined });
     }
   }
@@ -521,11 +593,13 @@ export async function completeWithFallback(
     );
     attemptLogs.push(...(third.attempts ?? []));
     if (third.result) {
+      recordCircuitAttempt(true, Date.now());
       return Object.assign(third.result, { keyLabel: third.keyUsed ?? undefined });
     }
   }
 
   // All providers and keys exhausted.
+  recordCircuitAttempt(false, Date.now());
   const e = new Error(
     "all AI providers and keys exhausted — set new API keys or wait for quota reset"
   ) as Error & { attempts?: AttemptLog[] };

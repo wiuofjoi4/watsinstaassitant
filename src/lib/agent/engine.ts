@@ -1,7 +1,8 @@
 import OpenAI from "openai";
+import { randomUUID } from "crypto";
 import { after } from "next/server";
 import { and, desc, eq, gte, sql } from "drizzle-orm";
-import { db } from "@/lib/db";
+import { db, rawClient } from "@/lib/db";
 import {
   agentConfigs,
   conversations,
@@ -33,6 +34,12 @@ import {
   ORDER_STATE_OPEN,
   type CondensedContext,
 } from "./summary";
+import { logEnvBanner } from "@/lib/env";
+import { maybeCheckSpendBudget } from "@/lib/alerts";
+
+// Per-process env checklist (idempotent). Runs on the cold start of any lambda
+// that hosts the agent so misconfiguration is impossible to miss in logs.
+logEnvBanner();
 
 export type Channel = "whatsapp" | "instagram";
 export type IncomingContentType = "text" | "image" | "voice" | "video";
@@ -107,7 +114,7 @@ export function jidToPhone(jid: string | null | undefined): string | null {
   // Only real user JIDs carry a phone. "lid" IDs, groups, broadcast/newsletter
   // channels are numeric but NOT phone numbers — never treat them as one.
   if (!["s.whatsapp.net"].includes(sv)) return null;
-  let digits = (local ?? "").split(":")[0].replace(/\D/g, "");
+  const digits = (local ?? "").split(":")[0].replace(/\D/g, "");
   return digits.length >= 7 ? digits : null;
 }
 
@@ -162,6 +169,22 @@ const HISTORY_LIMIT = 24;
 const REPLY_BUDGET_MS = 12_000;
 const TRANSCRIBE_TIMEOUT_MS = 10_000;
 
+// Cap the model's reply length. A realistic reply = 1-3 short Iraqi-dialect
+// sentences (~40-80 tokens) plus the [ORDER_STATE] JSON block (up to a few
+// hundred tokens for a big order with a long address). 500 gives generous
+// headroom over any natural reply while cutting off a runaway model — output
+// tokens are the most expensive ones, so this caps both cost and latency with
+// no quality loss on normal replies.
+const MAX_REPLY_TOKENS = 500;
+
+// Combined per-turn budget accounting (worst case, still well under the 60s
+// Vercel ceiling and the 55s gateway timeout): lock wait (5s) + transcription
+// (10s, voice only) + AI reply (12s) ≈ 27s. The lock wait is deliberately kept
+// small so a busy restaurant's rapid-fire messages can never eat the whole
+// turn on lock polling alone — a queue backlog must not become the reason a
+// customer gets nothing.
+const LOCK_WAIT_BUDGET_MS = 5_000;
+
 // The order-state contract appended to every call. The ONE reply of the turn
 // doubles as the order extractor: when the model updates/closes an order it
 // appends a self-describing block. The next turn's context re-condenses that
@@ -198,31 +221,80 @@ const DB_DOWN_REPLY =
 // instances and run handleIncomingMessage concurrently, causing interleaved /
 // duplicated AI replies and overwritten state. We serialize per
 // (restaurant + channel + remoteJid) so messages are processed in order.
-const conversationLocks = new Map<string, Promise<unknown>>();
-const conversationLockSeen = new Map<string, number>();
+//
+// Implemented as a tiny `conversation_locks` table (see migrate.ts) because
+// the database is Supabase's transaction pooler (PgBouncer): session-level
+// advisory locks would leak across pooled connections. The acquisition is a
+// single atomic `INSERT ... ON CONFLICT ... WHERE expires_at < now()` so the
+// lock is visible to ALL lambda instances, auto-reclaims stale locks (crash or
+// timeout safety) via a 30s TTL, and never holds a long transaction.
+
+const LOCK_RETRY_MS = 300;
+let lockAcquisitionCount = 0;
+
+async function acquireConversationLock(
+  lockKey: string,
+  token: string
+): Promise<boolean> {
+  // Opportunistic purge of expired rows — table stays bounded forever.
+  lockAcquisitionCount++;
+  if (lockAcquisitionCount % 100 === 0) {
+    await rawClient`DELETE FROM repli.conversation_locks WHERE expires_at < now()`.catch(
+      () => {}
+    );
+  }
+  const rows = await rawClient`
+    INSERT INTO repli.conversation_locks (lock_key, token, expires_at)
+    VALUES (${lockKey}, ${token}, now() + interval '30 seconds')
+    ON CONFLICT (lock_key) DO UPDATE
+      SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at
+      WHERE repli.conversation_locks.expires_at < now()
+    RETURNING token
+  `;
+  return (rows[0] as { token: string } | undefined)?.token === token;
+}
+
+async function releaseConversationLock(lockKey: string, token: string): Promise<void> {
+  // Only release if we still own it — never touch another holder's lock.
+  await rawClient`
+    DELETE FROM repli.conversation_locks
+    WHERE lock_key = ${lockKey} AND token = ${token}
+  `.catch(() => {});
+}
 
 async function withConversationLock<T>(
-  key: string,
+  lockKey: string,
   fn: () => Promise<T>
 ): Promise<T> {
-  const prev = conversationLocks.get(key) ?? Promise.resolve();
-  // Chain onto the previous worker whether it succeeded or failed; the next
-  // message is NOT skipped just because the prior one errored.
-  const next = prev.then(fn, fn);
-  conversationLocks.set(key, next.then(() => undefined, () => undefined));
-  conversationLockSeen.set(key, Date.now());
+  const token = randomUUID();
+  const deadline = Date.now() + LOCK_WAIT_BUDGET_MS;
+  let acquired = false;
 
-  // Bounded memory: every ~200 messages, drop locks not touched in 10 minutes.
-  if (conversationLocks.size > 2048) {
-    const cutoff = Date.now() - 10 * 60 * 1000;
-    for (const [k, last] of conversationLockSeen) {
-      if (last < cutoff) {
-        conversationLocks.delete(k);
-        conversationLockSeen.delete(k);
-      }
+  // Wait for the lock: poll briefly, mirroring the previous in-memory queue so
+  // rapid consecutive messages from the same customer still run in order.
+  while (!acquired && Date.now() < deadline) {
+    try {
+      acquired = await acquireConversationLock(lockKey, token);
+    } catch (err) {
+      // DB hiccup — don't block the customer's turn on lock bookkeeping.
+      console.error(`[LOCK] acquire error ${lockKey}: ${(err as Error).message}`);
+      break;
+    }
+    if (!acquired) {
+      await new Promise((r) => setTimeout(r, LOCK_RETRY_MS));
     }
   }
-  return next;
+
+  if (acquired) {
+    try {
+      return await fn();
+    } finally {
+      await releaseConversationLock(lockKey, token);
+    }
+  }
+  // Lock unavailable within budget (or DB down) — process anyway so the
+  // customer still gets a reply rather than being dropped or blocked forever.
+  return fn();
 }
 
 /** Resolve `p`, but reject after `ms` so side-work can never block the reply. */
@@ -467,8 +539,22 @@ async function buildMessages(
   const effectiveContext: CondensedContext = context.phone
     ? context
     : { ...context, phone: senderPhone ?? null };
+
+  // Full menu only when this turn may actually need it — order/price/menu
+  // intent, or a bare image (likely a food photo the model must map to the
+  // menu). Social turns omit the menu text entirely; the condensed context
+  // below already carries any items/prices already discussed. This is the
+  // single biggest per-turn token saving (a long menu dwarfs every other
+  // prompt section).
+  const textForGate = input.text?.trim() ?? "";
+  const menuNeeded =
+    ORDER_INTENT.test(textForGate) ||
+    MENU_QUESTION.test(textForGate) ||
+    ((input.contentType === "image" || input.contentType === "video") &&
+      textForGate === "");
+
   const systemPrompt =
-    buildSystemPrompt(profile, { senderPhone }) +
+    buildSystemPrompt(profile, { senderPhone, includeMenu: menuNeeded }) +
     orderContract(senderPhone) +
     (menuNote ? `\n\n${menuNote}` : "") +
     `\n\n${renderContextBlock(effectiveContext)}`;
@@ -517,6 +603,16 @@ const ORDER_INTENT =
 // but when it closes a chat that already carries order context (a product or
 // a phone number in the recent exchange) the Telegram push must still fire.
 const ORDER_CONFIRM = /تمام|نعم|اكيد|أكيد|موافق|زين|هيه|yes|\bok\b/i;
+
+// Menu-delivery gate: the FULL menu is only worth its tokens on turns that
+// actually touch the menu — asking for availability, prices, or the menu
+// itself, or starting an order. On purely social/browsing/confirming turns
+// the menu text is omitted from the prompt entirely (the condensed order
+// context below already carries any items/prices/users discussing). The gate
+// is deliberately broad: a real price/availability question must never be
+// missed, because that's the one place a halluncipated price escapes.
+const MENU_QUESTION =
+  /عندك|عندكم|موجود|متوفر|توفر|يتوفر|الكو|شكد|بشكد|كم سعر|سعره|سعر|أسعار|اسعار|بالسعر|بأي سعر|المنيو|المينيو|قائمه|قائمة|الأصناف|الصنف|اكل|أكل|شنو اكلكم|شو اكلكم|شنو الأكل|شو الأكل|what.*(price|cost)|price|menu|how much|have you got|do you have/i;
 
 export interface RunResult {
   replyText: string;
@@ -759,6 +855,7 @@ async function runIncomingMessage(
           model: getAgentModel(),
           temperature: profile.config.temperature,
           messages: messagesList,
+          max_tokens: MAX_REPLY_TOKENS,
         },
         { budgetMs: REPLY_BUDGET_MS, timeoutMs: REPLY_BUDGET_MS }
       );
@@ -800,6 +897,10 @@ async function runIncomingMessage(
       } catch (err) {
         await insertErrorBestEffort(input.restaurantId, "agent", "usage log write failed", err);
       }
+
+      // Budget alerts are best-effort + non-blocking (throttled inside to one
+      // DB sum per 5 min); a slow/errored check must never hold the reply.
+      void maybeCheckSpendBudget().catch(() => {});
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       replyText = GRACEFUL_FALLBACK;

@@ -16,18 +16,13 @@ import {
 import { sendTelegramMessage } from "@/lib/telegram";
 import { notifyTelegramOrder } from "@/lib/telegram";
 import type { AgentOrderResult } from "@/lib/agent/engine";
+import { gatewaySecretOk } from "@/lib/env";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function authOk(req: Request): boolean {
-  const expected = process.env.GATEWAY_SECRET;
-  const provided = req.headers.get("x-gateway-secret") ?? "";
-  return expected !== undefined && expected !== "" && provided === expected;
-}
-
 export async function GET(req: NextRequest) {
-  if (!authOk(req)) {
+  if (!gatewaySecretOk(req)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 

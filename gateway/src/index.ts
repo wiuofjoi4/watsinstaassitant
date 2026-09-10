@@ -20,6 +20,40 @@ const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 15000);
 
 const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
+// ---------------------------------------------------------------------------
+// Env guard — fail loud at boot in production when critical config is missing
+// or still a placeholder. The platform side now REJECTS calls without a real
+// GATEWAY_SECRET, so running without one silently kills every webhook call;
+// better to refuse to start than to look like it works.
+// ---------------------------------------------------------------------------
+function isPlaceholder(v: string): boolean {
+  const t = v.trim();
+  if (t === "") return true;
+  return (
+    /^(https?:\/\/)?(localhost|0\.0\.0\.0|127\.0\.0\.1)$/i.test(t) ||
+    /change[_-]?me|changeme|your[-_]?\w+|xxx+|y{3,}|^\*+$|^=+$|^<.*>$|^dev-secret$/i.test(
+      t
+    )
+  );
+}
+if (process.env.NODE_ENV === "production") {
+  const missing: string[] = [];
+  if (isPlaceholder(GATEWAY_SECRET)) missing.push("GATEWAY_SECRET");
+  if (!DATABASE_URL) missing.push("DATABASE_URL");
+  if (isPlaceholder(PLATFORM_URL) || PLATFORM_URL === "http://localhost:3000") {
+    missing.push("PLATFORM_URL");
+  }
+  if (missing.length > 0) {
+    logger.error(
+      { missing },
+      "FATAL: missing/placeholder env in production — refusing to start. " +
+        "Set GATEWAY_SECRET, DATABASE_URL and PLATFORM_URL to real values."
+    );
+    process.exit(1);
+  }
+  logger.info({ platform: PLATFORM_URL }, "env check OK");
+}
+
 const sql = DATABASE_URL
   ? postgres(DATABASE_URL, {
       ssl: process.env.NODE_ENV === "production" ? "require" : "prefer",
@@ -52,6 +86,73 @@ interface RecentEvent {
   error?: string;
 }
 const recent = new Map<string, RecentEvent>();
+
+// ---------------------------------------------------------------------------
+// Rate limiter — per remoteJid, sliding window
+// ---------------------------------------------------------------------------
+const RATE_LIMIT_MAX = 15; // messages per window
+const RATE_LIMIT_WINDOW_MS = 60_000; // 60 seconds
+const rateLimitBuckets = new Map<string, number[]>();
+
+function isRateLimited(remoteJid: string): boolean {
+  const now = Date.now();
+  const windowStart = now - RATE_LIMIT_WINDOW_MS;
+  let timestamps = rateLimitBuckets.get(remoteJid);
+  if (!timestamps) {
+    timestamps = [];
+    rateLimitBuckets.set(remoteJid, timestamps);
+  }
+  // Drop timestamps outside the window
+  while (timestamps.length > 0 && timestamps[0] <= windowStart) {
+    timestamps.shift();
+  }
+  if (timestamps.length >= RATE_LIMIT_MAX) {
+    return true;
+  }
+  timestamps.push(now);
+  return false;
+}
+
+// Periodic cleanup: every 2 minutes drop buckets with no recent activity.
+// Prevents unbounded memory growth when many customers message once and leave.
+setInterval(() => {
+  const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS * 2;
+  for (const [jid, ts] of rateLimitBuckets) {
+    if (ts.length === 0 || ts[ts.length - 1] < cutoff) {
+      rateLimitBuckets.delete(jid);
+    }
+  }
+}, 120_000);
+
+// ---------------------------------------------------------------------------
+// Message deduplication — in-memory, per message.key.id
+// WhatsApp sometimes re-delivers the same message event. This prevents
+// double-processing (double AI call, double reply).
+// Safe in single-instance gateway (Render). Would need a shared store
+// (DB table or Redis) if the gateway ever runs multi-instance.
+// ---------------------------------------------------------------------------
+const DEDUP_TTL_MS = 15 * 60_000; // keep seen IDs for 15 minutes
+const seenMessageIds = new Map<string, number>(); // key.id → timestamp
+
+function isDuplicateMessage(keyId: string): boolean {
+  const now = Date.now();
+  const prev = seenMessageIds.get(keyId);
+  if (prev !== undefined && now - prev < DEDUP_TTL_MS) {
+    return true; // already processed recently
+  }
+  seenMessageIds.set(keyId, now);
+  return false;
+}
+
+// Merge cleanup with the rate-limiter interval (runs every 2 minutes).
+// Entries older than DEDUP_TTL_MS are dropped. Overwritten below so both
+// maps are cleaned in the same timer tick.
+setInterval(() => {
+  const cutoff = Date.now() - DEDUP_TTL_MS;
+  for (const [id, ts] of seenMessageIds) {
+    if (ts < cutoff) seenMessageIds.delete(id);
+  }
+}, 120_000);
 
 function recordClose(restaurantId: string, connection: string | undefined, lastDisconnect?: unknown): void {
   const errObj = lastDisconnect as { error?: { output?: { statusCode?: number }; message?: string; stack?: string }; message?: string } | null;
@@ -217,6 +318,27 @@ async function startSession(restaurantId: string): Promise<void> {
       const remoteJid = m.key.remoteJid;
       if (!remoteJid) continue;
 
+      // Rate limit: reject messages beyond the per-customer cap BEFORE any
+      // processing or API calls. The customer gets a friendly nudge to slow
+      // down instead of silence or an error.
+      if (isRateLimited(remoteJid)) {
+        logger.warn(`rate limited ${restaurantId}/${remoteJid}`);
+        await sendFallback(
+          restaurantId,
+          remoteJid,
+          FALLBACK_REPLY_RATE_LIMIT
+        );
+        continue;
+      }
+
+      // Dedup: WhatsApp sometimes re-delivers the same message event.
+      // Skip silently — the customer already received a reply the first time.
+      const msgId = m.key.id;
+      if (msgId && isDuplicateMessage(msgId)) {
+        logger.info(`dedup skip ${restaurantId}/${remoteJid} msg=${msgId}`);
+        continue;
+      }
+
       try {
         const content = await handleMessage(session, m);
         if (content) {
@@ -248,6 +370,8 @@ const FALLBACK_REPLY_GENERIC =
   "عذراً صار تعطل بسيط بالخادم، كرر رسالتك بعد دقيقة 🙏";
 const FALLBACK_REPLY_MEDIA_TOO_LARGE =
   "عذراً، الصورة كبيرة هواية وما قدرت أقراها. أرسل صورة أصغر أو اكتب الوصف بالكلام 🙏";
+const FALLBACK_REPLY_RATE_LIMIT =
+  "تعال شوي رجاءً، وحدة وحدة 🙏";
 
 // Cap this under Vercel's 60s function budget so the abort fires BEFORE the
 // platform lambda is killed. If we wait too long, the platform gets nothing

@@ -307,6 +307,20 @@ export const errorLogs = repli.table(
   }
 );
 
+export const conversationLocks = repli.table(
+  "conversation_locks",
+  {
+    lockKey: text("lock_key").primaryKey(),
+    token: text("token").notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  },
+  (t) => {
+    return {
+      expiresIdx: index("conversation_locks_expires_idx").on(t.expiresAt),
+    };
+  }
+);
+
 export type Restaurant = typeof restaurants.$inferSelect;
 export type NewRestaurant = typeof restaurants.$inferInsert;
 export type AgentConfig = typeof agentConfigs.$inferSelect;
@@ -324,3 +338,5 @@ export type NewGatewaySession = typeof gatewaySessions.$inferInsert;
 export type TelegramBot = typeof telegramBots.$inferSelect;
 export type NewTelegramBot = typeof telegramBots.$inferInsert;
 export type TelegramOrderDelivery = typeof telegramOrderDeliveries.$inferSelect;
+export type ConversationLock = typeof conversationLocks.$inferSelect;
+export type NewConversationLock = typeof conversationLocks.$inferInsert;

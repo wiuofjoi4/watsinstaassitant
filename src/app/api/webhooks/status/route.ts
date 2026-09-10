@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { db } from "@/lib/db";
 import { restaurants } from "@/lib/db/schema";
+import { gatewaySecretOk } from "@/lib/env";
 
 export const runtime = "nodejs";
 
@@ -13,14 +14,8 @@ interface StatusBody {
   username?: string | null;
 }
 
-function validSecret(req: Request): boolean {
-  const expected = process.env.GATEWAY_SECRET;
-  if (!expected) return true;
-  return req.headers.get("x-gateway-secret") === expected;
-}
-
 export async function POST(req: Request) {
-  if (!validSecret(req)) {
+  if (!gatewaySecretOk(req)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

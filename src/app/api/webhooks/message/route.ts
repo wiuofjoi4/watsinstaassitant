@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { handleIncomingMessage } from "@/lib/agent/engine";
+import { gatewaySecretOk } from "@/lib/env";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -17,14 +18,8 @@ interface IncomingBody {
   messageId?: string | null;
 }
 
-function validSecret(req: Request): boolean {
-  const expected = process.env.GATEWAY_SECRET;
-  if (!expected) return true;
-  return req.headers.get("x-gateway-secret") === expected;
-}
-
 export async function POST(req: Request) {
-  if (!validSecret(req)) {
+  if (!gatewaySecretOk(req)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

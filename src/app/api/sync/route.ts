@@ -1,17 +1,12 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { restaurants } from "@/lib/db/schema";
+import { gatewaySecretOk } from "@/lib/env";
 
 export const runtime = "nodejs";
 
-function validSecret(req: Request): boolean {
-  const expected = process.env.GATEWAY_SECRET;
-  if (!expected) return true;
-  return req.headers.get("x-gateway-secret") === expected;
-}
-
 export async function GET(req: Request) {
-  if (!validSecret(req)) {
+  if (!gatewaySecretOk(req)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

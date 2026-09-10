@@ -48,6 +48,14 @@ CREATE TABLE IF NOT EXISTS "repli"."telegram_order_deliveries" (
 );
 --> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "telegram_order_deliveries_restaurant_idx" ON "repli"."telegram_order_deliveries" ("restaurant_id","requested_at" DESC);
+--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS "repli"."conversation_locks" (
+  "lock_key" text PRIMARY KEY NOT NULL,
+  "token" text NOT NULL,
+  "expires_at" timestamptz NOT NULL
+);
+--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "conversation_locks_expires_idx" ON "repli"."conversation_locks" ("expires_at");
 `;
 
 async function applyStatements(statements: string): Promise<void> {

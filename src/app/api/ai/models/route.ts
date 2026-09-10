@@ -4,6 +4,7 @@ import {
   getAgentModel,
   getProvider,
 } from "@/lib/ai/client";
+import { gatewaySecretOk } from "@/lib/env";
 
 export const dynamic = "force-dynamic";
 
@@ -13,9 +14,7 @@ export const dynamic = "force-dynamic";
  * so it is not exposed publicly.
  */
 export async function GET(req: Request) {
-  const secret = process.env.GATEWAY_SECRET;
-  const provided = req.headers.get("x-gateway-secret") ?? "";
-  if (!secret || provided !== secret) {
+  if (!gatewaySecretOk(req)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 

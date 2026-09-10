@@ -4,6 +4,7 @@ import { db } from "@/lib/db";
 import { restaurants } from "@/lib/db/schema";
 import { first } from "@/lib/db/query";
 import { handleIncomingMessage } from "@/lib/agent/engine";
+import { gatewaySecretOk } from "@/lib/env";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -16,8 +17,7 @@ interface TestBody {
 }
 
 export async function POST(req: Request) {
-  const expected = process.env.GATEWAY_SECRET;
-  if (!expected || req.headers.get("x-gateway-secret") !== expected) {
+  if (!gatewaySecretOk(req)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
