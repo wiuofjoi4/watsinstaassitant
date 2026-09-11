@@ -173,8 +173,8 @@ function splitReplyParts(text: string): string[] {
 // name + the scripted menu hand-off; a stable per-conversation seed picks one.
 function pickGreeting(restaurantName: string, seed: string): string {
   const variants = [
-    `وعليكم السلام، أهلاً بيك في ${restaurantName}، تفضل هذا المنيو 😊`,
-    `أهلاً بيك يا غالي في ${restaurantName}، هسه المنيو قدامك 😊`,
+    `وعليكم السلام، أهلاً بيك في ${restaurantName}، تفضل هذا المنيو`,
+    `أهلاً بيك يا غالي في ${restaurantName}، هسه المنيو قدامك`,
     `وعليكم السلام، أهلين بيك في ${restaurantName}، تفضل من المنيو شنو تحب؟`,
   ];
   let h = 0;
@@ -262,8 +262,8 @@ ${ORDER_STATE_OPEN}{"items":[{"name":"اسم الصنف","qty":1,"price":3.5}],"
 - جميع الأسعار بالدينار العراقي حصراً: price للصنف والمجموع total أرقام بالدينار (مثل price:25000) — لا تستخدم الدولار، ولا تفصل الآلاف بفاصلة عشرية في القيم الرقمية.
 ${
   phoneKnown
-    ? `- هاتف الزبون معروف تلقائياً من واتساب. ضعه في حقل phone ولا تطلب الرقم من الزبون أبداً.
-- ready=true عندما تتوفر الأصناف (الهاتف لا يُنتظر، فهو مُجلب آلياً).`
+    ? `- هاتف الزبون معروف تلقائياً من واتساب. ضعه في حقل phone ولا تطلب الرقم من الزبون أبداً. ONLY override the phone if the customer typed a DIFFERENT number in the CURRENT message (not from a previous order).
+- ready=true ONLY when the customer EXPLICITLY said they are done adding items (لا شكرا، خلص، ما أضيف شي، خلا، تمام) AND the address is collected. NOT when items are just listed — wait for the customer to confirm finalization.`
     : `- ready=true فقط إذا توفَّرت الأصناف ورقم الهاتف معاً (وإن توفر العنوان احفظه أيضاً).`
 }
 - في كل تحديث للطلب أعد كتابة الكتلة بالحالة الكاملة (لا تلخص جزئياً).
@@ -605,9 +605,11 @@ async function buildMessages(
   // model never sees the previous order's items/address.
   const effectiveContext: CondensedContext =
     clearedContext ??
-    (context.phone
-      ? context
-      : { ...context, phone: senderPhone ?? null });
+    (senderPhone
+      ? { ...context, phone: senderPhone }
+      : context.phone
+        ? context
+        : { ...context, phone: null });
 
   // Full menu only when this turn may actually need it — order/price/menu
   // intent, or a bare image (likely a food photo the model must map to the
@@ -768,9 +770,66 @@ const SCRIPT_BOT_ASK =
 const SCRIPT_NAME_ASK =
   /(?:شنو|شكو|مين|منو|من هو)\s*(?:اسمك|أسمك|انته|انت)\??|منو يحچي|مين يحچي|شكد اسمك|ما اسمك|اسمك شنو/i;
 
+// Customer confirming the order is final — no more items to add. The Telegram
+// push is gated on this: the order is NOT pushed until the customer explicitly
+// says they're done. Rewritten as a function so the Arabic alternation works
+// reliably (a bare regex with ^ anchors missed "لا، شكرا بس" / "لا اسوي"). 
+function isOrderDoneConfirm(text: string): boolean {
+  const t = (text ?? "").trim();
+  if (!t) return false;
+  // If the customer ALSO says they want to change/remove something, this is NOT
+  // a final confirmation ("لا هاهيه بس أريد أطلع التكة" = still editing).
+  if (/(?:أريد|ابي|نريد|ابي|بدي)\s*(?:أعدل|اعدل|أغير|اغير|أطلع|اطلع|ألغي|الغي)/i.test(t)) return false;
+  // A BARE "لا" closing the agent's own question ("تريد تضيف شي ثاني؟" → "لا")
+  // is a final answer. Strict anchor: only a bare "لا" (optionally + punct) —
+  // "لا التكة" (removing an item) or "لا أريد التكة" never match.
+  if (/^لا[،,.;؟!]?\s*$/i.test(t)) return true;
+  // "لا شكرا", "لا أشكرك", "لا هاهيه"
+  if (/لا\s*(?:شكرا|شكرن|أشكرك|هيه|هاهيه)/i.test(t)) return true;
+  // "ما أريد/لا أريد أضيف شي"، "ما أضيف/لا أضيف"، "لا أزيد/ما أزيد"
+  if (/(?:ما|مو|لا|ماكو)\s*(?:أريد|ابي|نريد)?\s*(?:أضيف|اضيف|أزيد|ازيد|زيادة|باقي|أكثر|اكثر|زيادة)/i.test(t)) return true;
+  // "خلص، خلصت، خليها، كافي" — no \b (Arabic isn't \w without /u).
+  if (/(?:^|[\s،,.;؟!])(?:خلص|خلاص|خليها|كافي|خلصت)(?:$|[\s،,.;؟!])/u.test(t)) return true;
+  // "هذا طلبي (كامل)"، "هذا كله"، "بس هذا"، "هذا الكل" — final confirmation.
+  // NOTE: "هذا طلبي" contains طلب which ORDER_INTENT would flag as an order
+  // verb, so these are matched explicitly WITHOUT the ORDER_INTENT guard.
+  if (/^(?:هذا طلبي|هذي طلبي|هذا كله|هاي كله|بس هذا|هذا الكل|هذا كلشي)(?:\s|$)/i.test(t)) return true;
+  // "تم، تمام، اوكي، أوكي، لا مزيد"
+  if (/^(?:تمام|تمت|اوك|اوكي|أوكي|زين تمام)(?:\s|,|،|$)/i.test(t) && !ORDER_INTENT.test(t)) return true;
+  return false;
+}
+
 // Menu → price lookup used by the canned "بيش X" reply. Conservative: only a
 // SINGLE best-matching menu line with an unambiguous numeric price is answered
 // deterministically; anything ambiguous falls back to the model (never guess).
+
+// Format prices the Iraqi colloquial way: 17500 → "17 ونص", 25000 → "25",
+// 7000 → "7". The unit is implicitly "ألف دينار" — Iraqis say "17 ونص" for
+// 17,500 IQD. The ORDER_STATE block keeps raw numeric prices for calculation.
+const HUNDREDS: Record<number, string> = {
+  100: "مية",
+  200: "ميتين",
+  300: "ثلاثمية",
+  400: "أربعمية",
+  500: "خمسمية",
+  600: "ستماية",
+  700: "سبعمية",
+  800: "ثمنماية",
+  900: "تسعمية",
+};
+function formatIraqiPrice(price: number): string {
+  if (!Number.isFinite(price) || price <= 0) return String(price);
+  const thousands = Math.floor(price / 1000);
+  const remainder = price % 1000;
+  if (thousands === 0) return String(price);
+  if (remainder === 0) return String(thousands);
+  if (remainder === 250) return `${thousands} وربع`;
+  if (remainder === 500) return `${thousands} ونص`;
+  if (remainder === 750) return `${thousands} وثلاثة أرباع`;
+  if (HUNDREDS[remainder]) return `${thousands} و${HUNDREDS[remainder]}`;
+  return `${thousands} و${remainder}`; // rare/non-round — say it plainly
+}
+
 function findMenuPrice(
   text: string,
   menu: string
@@ -1002,16 +1061,25 @@ async function runIncomingMessage(
   // AUTHORITATIVE phone on every completed order below (the owner verifies from
   // WhatsApp). Instagram: its remoteJid is an internal user ID, NOT a phone —
   // leave it to be asked there.
+  // BUG-FIX: previously context.phone (old typed number from a prior order)
+  // was preferred over senderPhone, causing the confirmation to show a stale
+  // number. Always use the real WhatsApp sender number; only the model's
+  // ORDER_STATE block (which fires when the customer types a NEW number in the
+  // current turn) may override it — and only the current message is checked.
   const senderPhone =
     input.channel === "whatsapp" ? jidToPhone(input.remoteJid) : null;
   const effectiveContext: CondensedContext =
-    context.phone || !senderPhone
-      ? context
-      : { ...context, phone: senderPhone };
+    senderPhone
+      ? { ...context, phone: senderPhone }
+      : context;
 
   const orderIntent =
     ORDER_INTENT.test(effectiveText) ||
     (ORDER_CONFIRM.test(effectiveText) && context.hasOrderMaterial);
+  // A bare final-confirmation ("لا شكرا"، "خلص") closes the pending order too
+  // — it is treated as order intent so the deterministic closure can build and
+  // push it even when the model omits the ORDER_STATE block this turn.
+  const closingConfirm = isOrderDoneConfirm(effectiveText) && context.hasOrderMaterial;
 
   // A NEW-order opener on a chat that already holds old order material. The
   // model must start from scratch (cleared context + note) instead of
@@ -1043,8 +1111,15 @@ async function runIncomingMessage(
     input.channel === "whatsapp"
       ? profile.restaurant.autoMenuWhatsapp
       : profile.restaurant.autoMenuInstagram;
+  // The menu PICTURES go out ONLY on the first turn of a conversation (the
+  // existing alreadySentMenu guard alone was not enough — once a plain text
+  // reply followed the images, the next non-order message re-triggered them,
+  // producing "menu at the end of the conversation". Owner wants: beginning
+  // only. historyRows was reversed + popped above, so length 0 = first turn.)
+  const isFirstTurn = historyRows.length === 0;
   if (
     menuToggle &&
+    isFirstTurn &&
     rawMenuImages.length > 0 &&
     hasAI &&
     effectiveText.trim() !== "" &&
@@ -1092,10 +1167,10 @@ async function runIncomingMessage(
       SCRIPT_BOT_ASK.test(textNorm) &&
       !ORDER_INTENT.test(textNorm)
     ) {
-      cannedReply = "هه، المهم أوصلك طلبك بأسرع وقت، شنو تحب تطلب؟ 😊";
+      cannedReply = "هه، المهم أوصلك طلبك بأسرع وقت، شنو تحب تطلب؟";
     }
     if (!cannedReply && SCRIPT_NAME_ASK.test(textNorm)) {
-      cannedReply = `أنا ${AGENT_NAME} من ${profile.config.businessName || profile.restaurant.name}، شكو تحتاج؟ 😊`;
+      cannedReply = `أنا ${AGENT_NAME} من ${profile.config.businessName || profile.restaurant.name}، شكو تحتاج؟`;
     }
     if (
       !cannedReply &&
@@ -1139,12 +1214,12 @@ async function runIncomingMessage(
     ) {
       const found = findMenuPrice(textNorm, menuText);
       if (found) {
-        cannedReply = `عيني، ${found.item} بـ ${found.priceText} دينار عراقي`;
+        cannedReply = `عيني، ${found.item} بـ ${formatIraqiPrice(found.price)} دينار عراقي`;
       }
     }
   }
   if (cannedReply) {
-    replyText = cannedReply;
+    replyText = stripEmojis(cannedReply) || cannedReply;
   } else if (!hasAI || effectiveText.trim() === "") {
     replyText =
       "عذراً، أني ما قدرت أعالج رسالتك. ترجع ترسلها مرة ثانية؟";
@@ -1155,7 +1230,7 @@ async function runIncomingMessage(
         input,
         context,
         sendMenuImages
-          ? `Note for THIS reply only: you will also send the customer the menu pictures along with your text. Acknowledge in one short line that you are sending the menu, and do NOT repeat the whole menu in text.`
+          ? `Note for THIS reply only: menu pictures are already sent with this reply — do NOT mention them in your text, do NOT write any line like "menu attached" or "menu pictures". Just answer naturally in a short friendly line and do NOT repeat the whole menu in text.`
           : undefined,
         senderPhone,
         clearedContext,
@@ -1225,7 +1300,9 @@ async function runIncomingMessage(
   const rawReply = replyText;
   const parsedOrder = parseOrderBlock(rawReply);
   const cleanReply = stripOrderBlock(rawReply).trim();
-  if (cleanReply) replyText = cleanReply;
+  // Hard guarantee: no emojis reach the customer (the prompt alone is not
+  // reliable on models). If stripping empties the reply, keep the original.
+  if (cleanReply) replyText = stripEmojis(cleanReply) || cleanReply;
 
   // Deterministic closure so the Telegram push never depends on the model
   // remembering the [ORDER_STATE] format. Preference order:
@@ -1236,7 +1313,7 @@ async function runIncomingMessage(
   //    be swallowed. A NEW-order opener (isOrderStart) never closes a previous
   //    order — it resets instead (see clearedContext above).
   let order: AgentOrderResult | null = parsedOrder;
-  if (!order && !isOrderStart && orderIntent && context.hasOrderMaterial) {
+  if (!order && !isOrderStart && (orderIntent || closingConfirm) && context.hasOrderMaterial) {
     if (context.items.length > 0) {
       order = {
         ready: true,
@@ -1259,18 +1336,46 @@ async function runIncomingMessage(
     }
   }
 
-  // WhatsApp: the sender's JID number is AUTHORITATIVE on every order turn —
-  // any phone the model put in the block is overwritten with it (the owner
-  // verifies delivery numbers straight from WhatsApp). Readiness is left
-  // untouched: only the model's ready:true or the deterministic closure above
-  // marks an order final.
+  // Detect if the customer's CURRENT message contains a phone number (Iraqi
+  // mobile format: 07xx xxxxxxx or +9647xx...). Used to decide whether to
+  // override the WhatsApp sender number with a customer-typed number for THIS
+  // order only.
+  const PHONE_IN_TEXT =
+    /(?:^|\D)(07[3-9]\d{8}|\+?9647[3-9]\d{8})(?:\D|$)/;
+  // Normalise any format (0, 964, +964, spaces, dashes) to a bare local number
+  // (no leading 0 / country code) so comparisons are format-agnostic.
+  function normPhone(p: string): string {
+    return p.replace(/\D/g, "").replace(/^964/, "").replace(/^0/, "");
+  }
+  function phoneInText(text: string): string | null {
+    const m = text.match(PHONE_IN_TEXT);
+    return m ? normPhone(m[1]) : null;
+  }
+
+// WhatsApp: the sender's JID number is the DEFAULT phone — the stale-number
+  // bug is fixed by effectiveContext always pinning phone = senderPhone above,
+  // so a number the customer typed in a PREVIOUS order can never leak. But if
+  // the customer explicitly stated a DIFFERENT number during THIS order (the
+  // model parked it in the ORDER_STATE block, or it appears in the current
+  // message), that number wins for THIS order only.
   if (
     order &&
     order.items.length > 0 &&
     input.channel === "whatsapp" &&
     senderPhone
   ) {
-    order = { ...order, phone: senderPhone };
+    const senderNorm = normPhone(senderPhone);
+    const typedThisMsg = phoneInText(effectiveText);
+    const blockPhone = order.phone ? normPhone(order.phone) : null;
+    let override: string | null = null;
+    if (typedThisMsg && typedThisMsg !== senderNorm) {
+      // Customer typed a different number in THIS order's current message.
+      override = normPhone(typedThisMsg);
+    } else if (blockPhone && blockPhone !== senderNorm && order.ready === true) {
+      // The model collected a different number during this order's flow.
+      override = blockPhone;
+    }
+    order = { ...order, phone: override ?? senderPhone };
   }
 
   // Fill a remaining phone gap on finalized orders (Instagram typed number, or
@@ -1293,6 +1398,17 @@ async function runIncomingMessage(
   // callable number (privacy/lid JIDs). Loudly warn ops instead of silently
   // swallowing the push.
   if (order && order.items.length > 0 && parsedOrder?.rawReady === true) {
+    order = { ...order, ready: true };
+  }
+  // Hard guarantee: the customer THIS turn explicitly said they're done ("لا
+  // شكرا" / "خلص" / "تمام") — mark the order final even if the model emitted
+  // a ready:false block or omitted the block entirely. The gate below still
+  // requires the address (when the restaurant asks for one) before pushing.
+  if (
+    order &&
+    order.items.length > 0 &&
+    isOrderDoneConfirm(effectiveText)
+  ) {
     order = { ...order, ready: true };
   }
   if (order && order.ready && !order.phone) {
@@ -1370,18 +1486,18 @@ async function runIncomingMessage(
 
   // Push every CONFIRMED order (date + order + address) to the restaurant's
   // Telegram bot, and log it so any user who messages the bot can read it.
-  // There is deliberately NO once-per-conversation gate: a returning customer's
-  // NEXT order must also reach Telegram (the old status == order_pending guard
-  // silently swallowed every later order from the same customer). Re-echo
-  // protection instead dedups against the most recent push — same restaurant + 
-  // phone + total + items within 5 minutes — because some models re-emit the
-  // [ORDER_STATE] block on no-op turns, which would otherwise spam Telegram
-  // with the same order twice. Runs under `after()` (post-response) so it gets
-  // the route's full 60s maxDuration instead of the shrinking handler deadline.
-  // The callback MUST return the awaited promise: an un-awaited floating
-  // promise lets Next consider `after` done instantly and the lambda is torn
-  // down before the insert+send completes.
-  if (order && order.ready) {
+  // GATE: only push when:
+  //   1) the model marked ready:true (items + phone confirmed)
+  //   2) the customer EXPLICITLY confirmed no more modifications this turn
+  //      ("لا شكرا" / "خلص" / "تمام" — see isOrderDoneConfirm)
+  //   3) delivery address is present when the restaurant requires it
+  // This prevents premature pushes mid-conversation before the customer
+  // finishes adding items.
+  const customerConfirmedDone = isOrderDoneConfirm(effectiveText);
+  const addressAvailable =
+    !!order?.address || !!effectiveContext.address;
+  const addressOk = !profile.config.askAddress || addressAvailable;
+  if (order && order.ready && customerConfirmedDone && addressOk) {
     const fingerprint = orderFingerprint(order);
     let duplicate = false;
     try {

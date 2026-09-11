@@ -168,7 +168,7 @@ export function condenseMessages(
 }
 
 const fmt = (n: number) =>
-  Number.isInteger(n) ? `$${n}` : `$${n.toFixed(2)}`;
+  Number.isInteger(n) ? `${n} دينار` : `${n.toFixed(2)} دينار`;
 
 /** Compact "conversation so far" block embedded in the system prompt. */
 export function renderContextBlock(c: CondensedContext): string {
