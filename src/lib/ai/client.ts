@@ -210,9 +210,9 @@ export function estimateCostUsd(
 function isQuotaError(err: unknown): boolean {
   const cast = err as { status?: unknown; code?: unknown; message?: string };
   const status = Number(cast?.status ?? cast?.code ?? NaN);
-  if (Number.isInteger(status) && status === 429) return true;
+  if (Number.isInteger(status) && (status === 429 || status === 402)) return true;
   const text = cast?.message ?? String(err);
-  return /429|quota|rate limit|RESOURCE_EXHAUSTED|RetryInfo/i.test(text);
+  return /429|402|quota|rate limit|insufficient credit|RESOURCE_EXHAUSTED|RetryInfo/i.test(text);
 }
 
 function isTransientError(err: unknown): boolean {
@@ -419,7 +419,21 @@ async function tryModels(
 
         try {
           const res = (await call(params, model, client)) as OpenAI.Chat.Completions.ChatCompletion;
-          return { result: res, keyUsed: label, errored: false, attempts };
+          const content = res.choices?.[0]?.message?.content;
+          if (content && String(content).trim() !== "") {
+            return { result: res, keyUsed: label, errored: false, attempts };
+          }
+          // A 200 with empty content is a FAILED model: reasoning-only models
+          // (e.g. some `:free` flash variants) can spend the whole token budget
+          // on reasoning and return no customer-facing text. The engine would
+          // otherwise reply with the "خلل بسيط" apology every time. Record it
+          // and fall through to the next model/key in the chain.
+          attempts.push({
+            model,
+            status: 0,
+            msg: `${label}: empty content (no customer-facing text)`,
+          });
+          continue;
         } catch (err) {
           const text = err instanceof Error ? err.message : String(err);
           const status = Number(
@@ -462,12 +476,21 @@ async function tryModels(
               if (remaining() <= 0) break outer;
               try {
                 const res2 = (await call(params, model, client)) as OpenAI.Chat.Completions.ChatCompletion;
-                return {
-                  result: res2,
-                  keyUsed: label,
-                  errored: false,
-                  attempts,
-                };
+                const content2 = res2.choices?.[0]?.message?.content;
+                if (content2 && String(content2).trim() !== "") {
+                  return {
+                    result: res2,
+                    keyUsed: label,
+                    errored: false,
+                    attempts,
+                  };
+                }
+                // Empty content after the quota retry — same handling as above.
+                attempts.push({
+                  model,
+                  status: 0,
+                  msg: `${label}: empty content after retry`,
+                });
               } catch (err2) {
                 lastErrored = isQuotaError(err2);
                 attempts.push({
@@ -483,8 +506,14 @@ async function tryModels(
             }
             // Cooldown exhausted — move to the next key/model.
             break;
+          } else if (isTransientError(err)) {
+            // 5xx / network hiccup — a server-side blip on THIS model endpoint,
+            // not an auth failure. Keep trying the remaining models/keys (this
+            // is what makes multi-model failover actually work under a free
+            // model overload instead of aborting the whole chain).
+            continue;
           }
-          // Non-quota, non-transient → fail immediately.
+          // Hard failure (auth 401/403, etc.) — fail this provider fast.
           return { result: null, keyUsed: null, errored: true, attempts };
         }
       }
