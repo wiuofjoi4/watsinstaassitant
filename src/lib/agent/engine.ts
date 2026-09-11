@@ -129,6 +129,59 @@ export function stripEmojis(text: string): string {
   return (text ?? "").replace(EMOJI_RE, "").replace(/\s{2,}/g, " ").trim();
 }
 
+// Staff persona (style guide): the agent has an Iraqi name it reveals ONLY when
+// the customer directly asks who is talking ("مين يحچي؟" / "شنو اسمك؟").
+const AGENT_NAME = "أحمد";
+
+// Split a long reply into short sequential WhatsApp messages (style guide:
+// "person typing while they think") — never dump one giant wall of text.
+const REPLY_PART_MAX = 160;
+const REPLY_PART_MAX_PARTS = 3;
+function splitReplyParts(text: string): string[] {
+  const t = text.trim();
+  if (!t || t.length <= REPLY_PART_MAX) return [];
+  const sentences = t
+    .split(/(?<=[.!؟?])\s+|[\r\n]+|(?<=[!؟?])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const parts: string[] = [];
+  let cur = "";
+  for (let i = 0; i < sentences.length; i++) {
+    const s = sentences[i];
+    const merged = cur ? `${cur} ${s}` : s;
+    if (merged.length > REPLY_PART_MAX && cur) {
+      parts.push(cur);
+      cur = s;
+      if (parts.length >= REPLY_PART_MAX_PARTS - 1) {
+        // Keep at most REPLY_PART_MAX_PARTS messages — fold the remainder into
+        // the last one instead of dropping anything.
+        const rest = sentences.slice(i + 1).join(" ");
+        parts.push(rest ? `${cur} ${rest}` : cur);
+        parts[parts.length - 1] = parts[parts.length - 1].trim();
+        break;
+      }
+    } else {
+      cur = merged;
+    }
+  }
+  if (cur && parts.length < REPLY_PART_MAX_PARTS) parts.push(cur);
+  return parts.length >= 2 ? parts : [];
+}
+
+// Rotating openers for the deterministic greeting so every customer doesn't get
+// the byte-identical phrase (style guide §2). All variants keep the restaurant
+// name + the scripted menu hand-off; a stable per-conversation seed picks one.
+function pickGreeting(restaurantName: string, seed: string): string {
+  const variants = [
+    `وعليكم السلام، أهلاً بيك في ${restaurantName}، تفضل هذا المنيو 😊`,
+    `أهلاً بيك يا غالي في ${restaurantName}، هسه المنيو قدامك 😊`,
+    `وعليكم السلام، أهلين بيك في ${restaurantName}، تفضل من المنيو شنو تحب؟`,
+  ];
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return variants[h % variants.length];
+}
+
 export interface AgentReply {
   text: string;
   transcribedFromVoice?: string | null;
@@ -705,6 +758,16 @@ const SCRIPT_STATUS_ASK =
 
 const NOT_STATUS_REQUEST = /اطلبي|اطلبه|أطلبيه|اطلبيه|بيش|بشكد|شكد/;
 
+// Style guide §4: the customer asking directly who/what is talking. The bot
+// answers deterministically — never denies, never lectures, pivots to order.
+const SCRIPT_BOT_ASK =
+  /(?:انته|انت|هوه|هو|هاي|هذا|هذه|انتي)\s?(?:بوت|روبوت|شات ?بوت|ذكاء اصطناعي|برنامج اوتوماتيك|نظام آلي|ai|chatbot)|(?:بوت|روبوت|شات ?بوت|ذكاء اصطناعي)\s*\?|انته بوت|هوه بوت/i;
+
+// "شنو اسمك؟ / مين يحچي؟ / انته مين؟ / مَنْ مقهوك؟". AGENT_NAME is revealed
+// only here and only when directly asked.
+const SCRIPT_NAME_ASK =
+  /(?:شنو|شكو|مين|منو|من هو)\s*(?:اسمك|أسمك|انته|انت)\??|منو يحچي|مين يحچي|شكد اسمك|ما اسمك|اسمك شنو/i;
+
 // Menu → price lookup used by the canned "بيش X" reply. Conservative: only a
 // SINGLE best-matching menu line with an unambiguous numeric price is answered
 // deterministically; anything ambiguous falls back to the model (never guess).
@@ -762,6 +825,10 @@ const priceText = String(best.price);
 
 export interface RunResult {
   replyText: string;
+  /** Optional split of replyText into 2-3 short sequential messages (style
+   * guide pacing). When present, the gateway sends each part with a natural
+   * pause instead of one long wall of text. */
+  replyParts?: string[];
   /** true when the turn deliberately requires NO customer reply (human
    * handling the chat) — the gateway must not auto-fallback in this case. */
   silent?: boolean;
@@ -1021,6 +1088,17 @@ async function runIncomingMessage(
 
     const greeting = textNorm.match(SCRIPT_GREETING);
     if (
+      !cannedReply &&
+      SCRIPT_BOT_ASK.test(textNorm) &&
+      !ORDER_INTENT.test(textNorm)
+    ) {
+      cannedReply = "هه، المهم أوصلك طلبك بأسرع وقت، شنو تحب تطلب؟ 😊";
+    }
+    if (!cannedReply && SCRIPT_NAME_ASK.test(textNorm)) {
+      cannedReply = `أنا ${AGENT_NAME} من ${profile.config.businessName || profile.restaurant.name}، شكو تحتاج؟ 😊`;
+    }
+    if (
+      !cannedReply &&
       greeting &&
       hasMenu &&
       !context.hasOrderMaterial &&
@@ -1029,7 +1107,10 @@ async function runIncomingMessage(
       !SCRIPT_MENU_REQUEST.test(textNorm.replace(SCRIPT_GREETING, "")) &&
       !ORDER_CONFIRM.test(textNorm.replace(SCRIPT_GREETING, ""))
     ) {
-      cannedReply = `وعليكم السلام، أهلاً بيك في ${profile.config.businessName || profile.restaurant.name}، تفضل هذا المنيو`;
+      cannedReply = pickGreeting(
+        profile.config.businessName || profile.restaurant.name,
+        conversation.id
+      );
       sendMenuImages = menuImagesPresent && sendMenuImages;
     }
     if (
@@ -1063,7 +1144,7 @@ async function runIncomingMessage(
     }
   }
   if (cannedReply) {
-    replyText = stripEmojis(cannedReply) || cannedReply;
+    replyText = cannedReply;
   } else if (!hasAI || effectiveText.trim() === "") {
     replyText =
       "عذراً، أني ما قدرت أعالج رسالتك. ترجع ترسلها مرة ثانية؟";
@@ -1144,9 +1225,7 @@ async function runIncomingMessage(
   const rawReply = replyText;
   const parsedOrder = parseOrderBlock(rawReply);
   const cleanReply = stripOrderBlock(rawReply).trim();
-  // Hard guarantee: no emojis reach the customer (the prompt alone is not
-  // reliable on models). If stripping empties the reply, keep the original.
-  if (cleanReply) replyText = stripEmojis(cleanReply) || cleanReply;
+  if (cleanReply) replyText = cleanReply;
 
   // Deterministic closure so the Telegram push never depends on the model
   // remembering the [ORDER_STATE] format. Preference order:
@@ -1369,6 +1448,7 @@ async function runIncomingMessage(
 
   return {
     replyText,
+    replyParts: splitReplyParts(replyText),
     transcription,
     order,
     costUsd,

@@ -570,7 +570,7 @@ async function deliver(
       return false;
     }
     const data = (await res.json()) as {
-      reply?: { text?: string } | null;
+      reply?: { text?: string; parts?: string[] } | null;
       images?: Array<{ base64?: string; mime?: string }>;
       silent?: boolean;
     };
@@ -578,6 +578,9 @@ async function deliver(
     // deliberely requires NO bot reply — do not auto-fallback over the human.
     if (data.silent === true) return false;
     const replyText = data.reply?.text;
+    const replyParts = Array.isArray(data.reply?.parts)
+      ? data.reply!.parts!.filter((p) => p && p.trim().length > 0)
+      : [];
     const session = sessions.get(restaurantId);
     if (!session?.connected) {
       // Session dropped (WhatsApp disconnect) — nothing to send to. Still log.
@@ -587,9 +590,10 @@ async function deliver(
       return false;
     }
 
-    // Human-like: small random delay before replying
-    const delay = 800 + Math.floor(Math.random() * 1800);
-    await new Promise((r) => setTimeout(r, delay));
+    // Human-like pacing (style guide §5): 2-5s natural "typing" delay before
+    // the first message, and a short pause between split parts.
+    const typingDelay = 2000 + Math.floor(Math.random() * 3000);
+    await new Promise((r) => setTimeout(r, typingDelay));
 
     // Send images one at a time; a failure on one image must NOT prevent the
     // text (the main reply) from going out.
@@ -611,10 +615,17 @@ async function deliver(
       }
     }
 
-    if (replyText && replyText.trim().length > 0) {
+    // Send the reply as a natural short sequence: either the split parts (each
+    // with a pause between, like a person typing while they think) or the
+    // single text when the reply was short.
+    let textSent = false;
+    const texts = replyParts.length > 0 ? replyParts : replyText ? [replyText] : [];
+    for (let i = 0; i < texts.length; i++) {
+      const t = texts[i];
+      if (!t || t.trim().length === 0) continue;
       try {
-        await session.socket.sendMessage(remoteJid, { text: replyText });
-        return true;
+        await session.socket.sendMessage(remoteJid, { text: t });
+        textSent = true;
       } catch (err) {
         logger.error(
           `deliver: reply send failed for ${restaurantId}/${remoteJid}: ${String(err)}`
@@ -624,7 +635,13 @@ async function deliver(
         await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
         return false;
       }
+      if (i < texts.length - 1) {
+        await new Promise((r) =>
+          setTimeout(r, 1200 + Math.floor(Math.random() * 1200))
+        );
+      }
     }
+    if (textSent) return true;
 
     if (!imagesSent) {
       // Platform said OK but produced neither text nor images (e.g. restaurant

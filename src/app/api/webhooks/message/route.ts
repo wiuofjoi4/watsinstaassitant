@@ -64,7 +64,14 @@ export async function POST(req: Request) {
         `costUsd=${(result?.costUsd ?? 0).toFixed(4)}`
     );
     return NextResponse.json({
-      reply: replyText ? { text: replyText } : null,
+      reply: replyText
+        ? {
+            text: replyText,
+            ...(result?.replyParts?.length
+              ? { parts: result.replyParts }
+              : {}),
+          }
+        : null,
       silent: result?.silent === true,
       images: (result?.menuImages ?? []).map((i) => ({
         base64: i.base64,
