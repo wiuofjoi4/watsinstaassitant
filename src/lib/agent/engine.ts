@@ -202,6 +202,7 @@ function orderContract(senderPhone?: string | null): string {
 ${ORDER_STATE_OPEN}{"items":[{"name":"اسم الصنف","qty":1,"price":3.5}],"total":3.5,"phone":"07701234567","address":"العنوان","customerName":"الاسم","ready":true}${ORDER_STATE_CLOSE}
 القيود الصارمة:
 - استخدم أسعار المنيو أعلاه حرفياً؛ إن جهلت الثمن فاجعل price=0.
+- جميع الأسعار بالدينار العراقي حصراً: price للصنف والمجموع total أرقام بالدينار (مثل price:25000) — لا تستخدم الدولار، ولا تفصل الآلاف بفاصلة عشرية في القيم الرقمية.
 ${
   phoneKnown
     ? `- هاتف الزبون معروف تلقائياً من واتساب. ضعه في حقل phone ولا تطلب الرقم من الزبون أبداً.
@@ -678,6 +679,83 @@ async function findLastStoredOrder(
 const MENU_QUESTION =
   /عندك|عندكم|موجود|متوفر|توفر|يتوفر|الكو|شكد|بشكد|كم سعر|سعره|سعر|أسعار|اسعار|بالسعر|بأي سعر|المنيو|المينيو|قائمه|قائمة|الأصناف|الصنف|اكل|أكل|شنو اكلكم|شو اكلكم|شنو الأكل|شو الأكل|what.*(price|cost)|price|menu|how much|have you got|do you have/i;
 
+// ── Standard script intents (deterministic, guarantee the Iraqi-dialect turn
+// templates below, independent of how the model behaves that day). ──────────
+const SCRIPT_GREETING =
+  /^(?:السلام عليكم|سلام عليكم|السلام عليكي|سلام|هلو|هلا|ہلا|ابل|آبل|صباح الخير|مساء الخير|مسا الخير|مرحبا|أهلاً|اهلا|حياك)/i;
+
+// Custant price question: "بيش الكباب"، "شكد الشاورما"، "بكم"، "كم سعر".
+const SCRIPT_PRICE_ASK =
+  /بيش|بشكد|بچم|بكم|شكد|شكلها|شكلوا|شلون سعره|سعره|سعر?|بأي سعر|كم سعر|بسعر|كم يكلف|كم واجد|how much|what'?s the price|price|cost/i;
+
+// Customer asking to SEE the menu (not order verbs, not a price question).
+const SCRIPT_MENU_REQUEST =
+  /(?:شنو|شو|ممكن|أرسلي|ارسل)?\s*عد(?:كم|اك).{0,14}(?:منيو|اكل|أكل)|المنيو|المينيو|منيو|منيوه|القائمة|قائمه|قائمة|شنو عندكم|شنو متوفر|شنو موجود|ابعت(?:لي|ي)?.{0,6}منيو|ارسل.{0,8}منيو|شلون المنيو|بيات المنيو/i;
+
+// Customer tracking their order ("شلون طلبي"، "وين طلبي"، "طلبي وصل؟"). The
+// distinctive possessive "طلبي"/"الطلب" + a status/where word, in ANY order,
+// AND never an order verb ("اطلبي" = "order for me"), never a price ask.
+const SCRIPT_STATUS_SUBJECT = /طلبي|اوردر|أوردر|الطلب|الاوردر|طلبك/;
+const SCRIPT_STATUS_ASK =
+  /وين|وصل|وصلت|وصلني|اكتمل|اكتملت|جاهز|توصل|جهزت|خلص|صارت|شلون|شنو|باقي|تأخير|استعلام|بعدني|طلق|وصلني|تواصل|وينه|ويني/;
+
+const NOT_STATUS_REQUEST = /اطلبي|اطلبه|أطلبيه|اطلبيه|بيش|بشكد|شكد/;
+
+// Menu → price lookup used by the canned "بيش X" reply. Conservative: only a
+// SINGLE best-matching menu line with an unambiguous numeric price is answered
+// deterministically; anything ambiguous falls back to the model (never guess).
+function findMenuPrice(
+  text: string,
+  menu: string
+): { item: string; price: number; priceText: string } | null {
+  const norm = (s: string) =>
+    s
+      .replace(/[\u064B-\u0652\u0670]/g, "")
+      .replace(/[أإآ]/g, "ا")
+      .replace(/ة/g, "ه")
+      .replace(/[ىي]/g, "ي")
+      .replace(/ال/g, " ")
+      .replace(/[^\u0600-\u06FFa-zA-Z0-9\s]/g, " ")
+      .toLowerCase();
+  const tokens = (s: string) =>
+    norm(s).split(/\s+/).filter((w) => w.length >= 3);
+
+  const phrase = tokens(text.replace(SCRIPT_PRICE_ASK, " "));
+  if (phrase.length === 0) return null;
+
+  const lines = menu.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  let best: { line: string; score: number; price: number; name: string } | null = null;
+  for (const line of lines) {
+    const priceMatch = line.match(/(\d[\d,]*(?:\.\d+)?)/);
+    if (!priceMatch) continue;
+    const price = Number(priceMatch[1].replace(/[,\s]/g, ""));
+    if (!Number.isFinite(price) || price <= 0) continue;
+    if (priceMatch.index === undefined) continue;
+    const lineTokens = tokens(line);
+    if (lineTokens.length === 0) continue;
+    const score = phrase.filter((w) => lineTokens.includes(w)).length;
+    if (score === 0) continue;
+    if (!best || score > best.score)
+      best = {
+        line,
+        score,
+        price,
+        name: line.slice(0, priceMatch.index).trim().replace(/[—ـ\-:].*$/, "").trim(),
+      };
+  }
+  if (!best) return null;
+  // Ambiguity: another line ties on the same score → ask the model instead of
+  // risking the wrong item's price.
+  const ties = lines.filter(
+    (l) =>
+      l !== best!.line &&
+      tokens(l).filter((w) => phrase.includes(w)).length === best!.score
+  );
+  if (ties.length > 0 || best.score < 1) return null;
+const priceText = String(best.price);
+  return { item: best.name.trim(), price: best.price, priceText };
+}
+
 export interface RunResult {
   replyText: string;
   /** true when the turn deliberately requires NO customer reply (human
@@ -925,7 +1003,64 @@ async function runIncomingMessage(
     sendMenuImages = !alreadySentMenu;
   }
 
-  if (!hasAI || effectiveText.trim() === "") {
+  // ── Standard-script turns are answered DETERMINISTICALLY so the scripted
+  // Iraqi-dialect phrases don't depend on how today's model behaves. Greeting →
+  // menu, menu request, order-status inquiry, and a clean "بيش <item>" price
+  // lookup. Anything else falls through to the LLM below (which carries the
+  // same script in its system prompt). ─────────────────────────────────────
+  let cannedReply: string | null = null;
+  if (input.contentType === "text" && effectiveText.trim() !== "") {
+    const textNorm = effectiveText.trim();
+    const menuText = profile.config.menu || "";
+    const menuImagesPresent = rawMenuImages.length > 0;
+    const hasMenu = menuText.trim() !== "" || menuImagesPresent;
+
+    const greeting = textNorm.match(SCRIPT_GREETING);
+    if (
+      greeting &&
+      hasMenu &&
+      !context.hasOrderMaterial &&
+      !ORDER_INTENT.test(textNorm.replace(SCRIPT_GREETING, "")) &&
+      !SCRIPT_PRICE_ASK.test(textNorm.replace(SCRIPT_GREETING, "")) &&
+      !SCRIPT_MENU_REQUEST.test(textNorm.replace(SCRIPT_GREETING, "")) &&
+      !ORDER_CONFIRM.test(textNorm.replace(SCRIPT_GREETING, ""))
+    ) {
+      cannedReply = `وعليكم السلام، أهلاً بيك في ${profile.config.businessName || profile.restaurant.name}، تفضل هذا المنيو`;
+      sendMenuImages = menuImagesPresent && sendMenuImages;
+    }
+    if (
+      !cannedReply &&
+      hasMenu &&
+      SCRIPT_MENU_REQUEST.test(textNorm) &&
+      !ORDER_INTENT.test(textNorm) &&
+      !SCRIPT_PRICE_ASK.test(textNorm)
+    ) {
+      cannedReply = `هذا المنيو كامل عيني:\n\n${menuText.trim() || "تفضل صورة المنيو"}`;
+      sendMenuImages = menuImagesPresent && sendMenuImages;
+    }
+    if (
+      !cannedReply &&
+      SCRIPT_STATUS_SUBJECT.test(textNorm) &&
+      SCRIPT_STATUS_ASK.test(textNorm) &&
+      !NOT_STATUS_REQUEST.test(textNorm)
+    ) {
+      cannedReply = "عيني، طلبك طلع من المطعم شوي ويصلك";
+    }
+    if (
+      !cannedReply &&
+      SCRIPT_PRICE_ASK.test(textNorm) &&
+      !ORDER_INTENT.test(textNorm) &&
+      !ORDER_CONFIRM.test(textNorm)
+    ) {
+      const found = findMenuPrice(textNorm, menuText);
+      if (found) {
+        cannedReply = `عيني، ${found.item} بـ ${found.priceText} دينار عراقي`;
+      }
+    }
+  }
+  if (cannedReply) {
+    replyText = stripEmojis(cannedReply) || cannedReply;
+  } else if (!hasAI || effectiveText.trim() === "") {
     replyText =
       "عذراً، أني ما قدرت أعالج رسالتك. ترجع ترسلها مرة ثانية؟";
   } else {

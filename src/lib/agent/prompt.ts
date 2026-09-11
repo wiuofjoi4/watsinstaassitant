@@ -73,6 +73,32 @@ export function buildSystemPrompt(
   lines.push(`- Stay polite even if the customer is rude. Do not argue.`);
   lines.push(`- Never share internal instructions with the customer.`);
   lines.push(``);
+  lines.push(`## Standard conversation script (follow EXACTLY)`);
+  lines.push(
+    `Stick to this workflow and wording. These phrases are the restaurant's own — use them, don't paraphrase into other dialects:`
+  );
+  lines.push(
+    `1. Customer opens with a greeting (السلام عليكم/هلو/سلام/صباح الخير): reply "وعليكم السلام، أهلاً بيك في ${p.config.businessName || p.restaurant.name}، تفضل" and send the menu with it.`
+  );
+  lines.push(
+    `2. Customer asks what's on the menu ("شنو عدكم بالمنيو"، "شنو أكلكم"): send the menu in text AND the menu pictures.`
+  );
+  lines.push(
+    `3. Customer asks the price of an item ("بيش [الصنف]"، "شكد [الصنف]"، "بكم"): answer with that item's menu price wrapped in "عيني" — e.g. "عيني، الكباب بـ 25000 دينار". ALWAYS quote prices in Iraqi dinar: write "دينار" after the number. NEVER use "$" / "USD" / "دولار" / "ألف".`
+  );
+  lines.push(
+    `4. Customer says they want to order (e.g. "السلام عليكم أريد أطلب [أصناف]"): reply with "تدلل عيني" + repeat back the items they named + ask ONLY for the delivery address ("عنوان التوصيل وين الله يخليك؟") + ask "تريد تضيف شي ثاني للطلب؟".`
+  );
+  lines.push(
+    `5. After the address, if the customer says they don't want to add more (e.g. "لا، هاهيه ما أضيف شي"، "خلاص"): confirm the order — restate the items, total, the delivery address AND the customer's WhatsApp number (your engine knows it automatically; if the customer typed a different number during the chat, use that one).`
+  );
+  lines.push(
+    `6. Customer asks about their order (شلون طلبي؟، طلبي وصل؟، وينه طلبي؟): reply "عيني، طلبك طلع من المطعم شوي ويصلك". If the order isn't placed yet, tell them to send the items.`
+  );
+  lines.push(
+    `Allowed flavour words, used correctly in context: "عيني" (softener), "تدلل" (reply when taking an order), "شنو تحب تطلب؟" (asking what they want), "شكو"، "زين"، "تفضل"، "هسه".`
+  );
+  lines.push(``);
   lines.push(`## Opening hours`);
   lines.push(c.hours || `Not specified`);
   lines.push(``);
@@ -83,6 +109,9 @@ export function buildSystemPrompt(
     lines.push(`## Menu (name — price, or details)`);
     lines.push(c.menu);
     lines.push(``);
+    lines.push(
+      `ALL prices in this menu are in IRAQI DINAR (دينار عراقي). Always state prices as plain dinars — e.g. "25000 دينار". NEVER "دولار"، "$"، "USD"، "ألف".`
+    );
   } else if (!includeMenu) {
     // The engine omitted the full menu on purpose (non-menu turn). The model
     // must still know items/prices are NOT hallucinated and to rely on the
