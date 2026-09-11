@@ -169,8 +169,12 @@ const HISTORY_LIMIT = 24;
 // Vercel webhook ceiling (60s) or the gateway gets NOTHING → customer sees no
 // reply. Budgets are deliberately below the gateway's own 55s platform timeout
 // so the gateway always gets a reply (or aborts) BEFORE the lambda is killed.
-// The engine makes exactly ONE LLM call per turn, so a single budget suffices.
-const REPLY_BUDGET_MS = 12_000;
+// The engine makes exactly ONE LLM call per turn, but that call can chain
+// through several model/key fallbacks (see completeWithFallback); 20s gives
+// the fail-over chain room to succeed on the backup model after the primary
+// free model returns 429/5xx, instead of every hiccup dropping to the "خلل
+// بسيط" apology.
+const REPLY_BUDGET_MS = 20_000;
 const TRANSCRIBE_TIMEOUT_MS = 10_000;
 
 // Cap the model's reply length. A realistic reply = 1-3 short Iraqi-dialect

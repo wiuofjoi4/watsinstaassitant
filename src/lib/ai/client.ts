@@ -115,6 +115,29 @@ export const OR_MODEL =
 export const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.6-flash";
 export const TRANSCRIBE_MODEL = process.env.TRANSCRIBE_MODEL ?? "whisper-1";
 
+// OpenRouter `:free` models are heavily rate-limited — under load they return
+// 429/5xx intermittently, and with ONLY `OR_MODEL` configured the whole turn
+// falls back to "عذراً صار خلل بسيط" every time the free model hiccups (the
+// #1 cause of intermittent no-replies in production). When OR_MODEL fails we
+// fail over to a short list of broadly-available cheap/free models (404/402
+// are skipped fast by tryModels, so stale IDs are harmless). Override with the
+// `OR_FALLBACK_MODELS` env var (comma-separated).
+const OPENROUTER_FALLBACKS = (process.env.OR_FALLBACK_MODELS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const OR_FALLBACK_LIST = (
+  OPENROUTER_FALLBACKS.length > 0
+    ? OPENROUTER_FALLBACKS
+    : [
+        "meta-llama/llama-3.3-70b-instruct:free",
+        "qwen/qwen3-235b-a22b:free",
+        "deepseek/deepseek-chat-v3-0324:free",
+        "google/gemini-2.5-flash",
+      ]
+).filter((m) => m !== OR_MODEL);
+const OPENROUTER_MODELS = [OR_MODEL, ...OR_FALLBACK_LIST];
+
 function openRouterReferer(): string {
   return (
     process.env.NEXT_PUBLIC_APP_URL ??
@@ -132,7 +155,7 @@ const GEMINI_FALLBACKS = [
 
 function modelChain(provider: Provider): string[] {
   if (provider === "openai") return [AGENT_MODEL];
-  if (provider === "openrouter") return [OR_MODEL];
+  if (provider === "openrouter") return OPENROUTER_MODELS;
 
   const explicit = process.env.GEMINI_MODELS;
   let models: string[];
@@ -529,7 +552,7 @@ export async function completeWithFallback(
   if (providers.includes("openrouter")) {
     const openrouterFirst = await tryModels(
       params,
-      [OR_MODEL],
+      OPENROUTER_MODELS,
       ["openrouter"],
       budgetEndMs,
       timeoutMs
