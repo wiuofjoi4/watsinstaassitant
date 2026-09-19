@@ -184,6 +184,17 @@ async function main(): Promise<void> {
     "delivered ack on expired must not mutate"
   );
 
+  // Targeted claim (the gateway triggers this with a specific jobId):
+  // must claim the exact job, and a second call on the same jobId must return
+  // null (already processing).
+  const fresh = await enqueueMessageJob(jobInput("mid-7", "964700000000007"));
+  const targeted = await claimQueuedJob(rid, 45, fresh.jobId);
+  check(targeted != null && targeted.id === fresh.jobId, "targeted claim must return the requested queued job");
+  const bogus = await claimQueuedJob(rid, 45, "00000000-0000-0000-0000-000000000000");
+  check(bogus == null, "targeted claim of a bogus uuid must return null");
+  const again = await claimQueuedJob(rid, 45, fresh.jobId);
+  check(again == null, "targeted claim of an already-processing job must return null");
+
   if (failures.length > 0) {
     throw new Error(failures.join("; "));
   }

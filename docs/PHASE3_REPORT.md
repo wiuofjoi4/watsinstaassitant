@@ -41,9 +41,13 @@ A **fix** was applied during integration: `src/lib/selftest/queue.selftest.ts` u
 
 ## 4. Known ambiguities / follow-ups
 
+- **Hotfix (post-deploy, production symptom): the job queue had NO executor.** The webhook enqueues and returns `{accepted, jobId}`, but nothing triggered `POST /api/jobs/run` — every job sat `queued` forever, the poll budget (55s) burned out, and every customer saw `FALLBACK_REPLY_GENERIC` ("عذراً صار تعطل بسيط بالخادم…"). Fix (deployed in the following commit):
+  - **M3**: `claimQueuedJob(restaurantId, leaseSeconds, jobId?)` + `runNextJob(restaurantId, jobId?)` + `POST /api/jobs/run` now accept an optional targeted `jobId` so the gateway claims the exact job it just enqueued (never an older one).
+  - **M8 (gateway)**: `deliverJob` now fires `POST /api/jobs/run {restaurantId, jobId}` whenever the polled job is not yet `processing`/`sending` and the last trigger is stale — a dropped trigger or network blip self-heals instead of stranding the job. `selftest-delivery.ts` gained case G asserting the run trigger fires for a `queued` job.
+  - **Outbox**: each sweep now fires a best-effort `POST /api/jobs/run` for connected sessions before scanning `/api/jobs/pending`, so jobs enqueued right before a gateway restart are still executed.
 - **Wiring of M5 sessionCache + M6 visionCache into the engine is NOT done.** Both modules are built and self-tested but the engine (`engine.ts`, Combiner-owned) still uses its own context loading. Wiring them is a separate, safe follow-up (additive reads), but it was consciously deferred to avoid touching the frozen engine in this pass. Documented here per plan §progress expectations.
 - **M1 flagged**: retryable disconnects reconnect quietly through the new tracker (no status flap) — an intentional interpretation. It makes the health/reconnect surface calmer; if you want status flapping on retryable closes, that is a one-line change in `gateway/src/conn/state.ts`.
-- **`WEBHOOK_MODE=sync`** (rollback flag) restores the legacy inline engine call + byte-for-byte response shape; gateway's `deliver()` deals with both shapes.
+- **`WEBHOOK_MODE=sync`** (rollback flag) restores the legacy inline engine call + byte-for-byte response shape; gateway's `deliver()` deals with both shapes. Verified unset in all environment files (async active).
 
 ## 5. Rollback procedure
 

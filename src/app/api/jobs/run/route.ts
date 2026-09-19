@@ -11,10 +11,15 @@ export async function POST(req: Request) {
   }
 
   let restaurantId: string;
+  let jobId: string | undefined;
   try {
-    const body = (await req.json()) as { restaurantId?: unknown };
+    const body = (await req.json()) as {
+      restaurantId?: unknown;
+      jobId?: unknown;
+    };
     restaurantId =
       typeof body?.restaurantId === "string" ? body.restaurantId.trim() : "";
+    jobId = typeof body?.jobId === "string" && body.jobId.trim() ? body.jobId.trim() : undefined;
   } catch {
     return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
   }
@@ -27,7 +32,7 @@ export async function POST(req: Request) {
   }
 
   try {
-    const outcome = await runNextJob(restaurantId);
+    const outcome = await runNextJob(restaurantId, jobId);
     return NextResponse.json({ ok: true, ...outcome });
   } catch (err) {
     console.error(

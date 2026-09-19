@@ -48,8 +48,11 @@ async function safeQueueDepth(restaurantId: string): Promise<number> {
   }
 }
 
-export async function runNextJob(restaurantId: string): Promise<RunJobOutcome> {
-  const claimed = await claimQueuedJob(restaurantId);
+export async function runNextJob(
+  restaurantId: string,
+  jobId?: string
+): Promise<RunJobOutcome> {
+  const claimed = await claimQueuedJob(restaurantId, 45, jobId);
   if (!claimed) {
     return { job: null, queuedCount: await safeQueueDepth(restaurantId) };
   }

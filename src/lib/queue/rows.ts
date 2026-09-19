@@ -46,12 +46,15 @@ export function messageJobFromRow(row: Record<string, unknown>): MessageJob {
 
 /**
  * Atomic claim of ONE queued job for a restaurant (FOR UPDATE SKIP LOCKED +
- * 45s lease). Returns null when nothing is claimable. Status is set to
- * 'processing' here; lease_expires_at guards against stuck leases.
+ * 45s lease). When `jobId` is given, claims THAT specific queued job (used by
+ * the gateway to run the exact job it just enqueued); otherwise claims the
+ * oldest claimable job. Returns null when nothing is claimable. Status is set
+ * to 'processing' here; lease_expires_at guards against stuck leases.
  */
 export async function claimQueuedJob(
   restaurantId: string,
-  leaseSeconds = 45
+  leaseSeconds = 45,
+  jobId?: string
 ): Promise<MessageJob | null> {
   const rows = await rawClient`
     update repli.message_jobs
@@ -65,6 +68,7 @@ export async function claimQueuedJob(
       where restaurant_id = ${restaurantId}
         and status = 'queued'
         and (next_attempt_at is null or next_attempt_at <= now())
+        ${jobId ? rawClient`and id = ${jobId}` : rawClient``}
       order by created_at
       limit 1
       for update skip locked

@@ -441,6 +441,64 @@ async function caseOutbox(): Promise<void> {
   check("outbox: cancel stops the loop (no leaked timer)", acks.length === acksAfterCancel, `acks=${acks.length}`);
 }
 
+// ---------------------------------------------------------------------------
+// Case G — accepted + job stays QUEUED → gateway fires POST /api/jobs/run
+// (the M8↔M3 claim link) → poll sees ready → compose + send + ack delivered
+// ---------------------------------------------------------------------------
+async function caseQueuedNeedsRunTrigger(): Promise<void> {
+  const rid = uid("run-trigger");
+  const { session, calls } = makeFakeSession(rid);
+  registerSession(session);
+  const runTriggers: Array<{ restaurantId: string; jobId: string }> = [];
+  const acks: Array<{ jobId: string; body: any }> = [];
+  let pollCalls = 0;
+  setFetch(async (url, init) => {
+    const u = String(url);
+    if (u.includes("/api/webhooks/message")) {
+      return jsonResponse({ accepted: true, jobId: "j7" });
+    }
+    if (u.includes("/api/jobs/run")) {
+      runTriggers.push(JSON.parse(String(init?.body)));
+      return jsonResponse({ ok: true, job: { id: "j7", status: "processing" } });
+    }
+    if (u.includes("/api/jobs/result")) {
+      pollCalls++;
+      if (pollCalls === 1) return jsonResponse({ ok: true, status: "queued" });
+      return jsonResponse({
+        ok: true,
+        status: "ready",
+        result: { replyText: "تم الاستلام", replyParts: [], silent: false },
+      });
+    }
+    if (u.includes("/api/jobs/ack")) {
+      acks.push({ jobId: "j7", body: JSON.parse(String(init?.body)) });
+      return jsonResponse({ ok: true });
+    }
+    return jsonResponse({ ok: true, jobs: [] });
+  });
+  const result = await deliver(
+    rid,
+    session.lastJid!,
+    { contentType: "text", text: "اهلا" },
+    "msg-g"
+  );
+  check("G: queued-then-ready deliver returns true", result === true);
+  check(
+    "G: gateway fired POST /api/jobs/run for the queued job",
+    runTriggers.length > 0 &&
+      runTriggers.some((r) => r.restaurantId === rid && r.jobId === "j7"),
+    JSON.stringify(runTriggers)
+  );
+  check("G: poll saw the job after the trigger", pollCalls >= 2, `pollCalls=${pollCalls}`);
+  const texts = calls.filter((c) => c.kind === "text").map((c) => c.text);
+  check("G: ready reply sent after trigger", texts.includes("تم الاستلام"), texts.join(" | "));
+  check(
+    "G: ack delivered:true after send",
+    acks.length === 1 && acks[0].jobId === "j7" && acks[0].body.delivered === true,
+    JSON.stringify(acks)
+  );
+}
+
 async function main(): Promise<void> {
   // Fast offline polling: 1ms intervals keep the poll tests instant. Real
   // production defaults (2000ms / 55s) are untouched by the running gateway.
@@ -453,6 +511,7 @@ async function main(): Promise<void> {
   await caseTimeoutConnected();
   await caseTimeoutDisconnected();
   await caseDuplicate();
+  await caseQueuedNeedsRunTrigger();
   await caseOutbox();
 
   cleanupSessions();

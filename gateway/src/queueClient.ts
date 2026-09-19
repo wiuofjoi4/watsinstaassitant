@@ -100,6 +100,29 @@ async function outboxFallback(
   }
 }
 
+/** Best-effort POST /api/jobs/run to claim+execute the next queued job of a
+ * connected session's restaurant. Idempotent against the atomic claim: if the
+ * inline poll already claimed a job it returns that job; otherwise it pulls one
+ * from the queue (or null when empty). Safety net so jobs enqueued right before
+ * a gateway restart are still executed. Never throws. */
+async function triggerQueuedRun(restaurantId: string): Promise<void> {
+  try {
+    const res = await fetch(`${PLATFORM_URL}/api/jobs/run`, {
+      method: "POST",
+      headers: platformHeaders(),
+      body: JSON.stringify({ restaurantId }),
+      signal: AbortSignal.timeout(OUTBOX_FETCH_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      logger.warn(
+        `outbox: jobs/run returned ${res.status} for ${restaurantId} — leaving queued jobs`
+      );
+    }
+  } catch (err) {
+    logger.warn(`outbox: jobs/run failed for ${restaurantId}: ${String(err)}`);
+  }
+}
+
 async function sweepOutbox(
   getSessions: () => Map<string, Session>
 ): Promise<void> {
@@ -112,6 +135,9 @@ async function sweepOutbox(
   }
   for (const session of sessionsList) {
     if (!session?.connected) continue;
+    // Pull any still-queued job into execution before scanning ready results,
+    // so a restart that happened between enqueue and claim self-heals.
+    await triggerQueuedRun(session.restaurantId);
     try {
       const res = await fetch(
         `${PLATFORM_URL}/api/jobs/pending?restaurantId=${encodeURIComponent(

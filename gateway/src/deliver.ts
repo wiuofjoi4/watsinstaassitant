@@ -251,9 +251,57 @@ interface WebhookResponse {
 }
 
 /**
+ * Trigger the platform to claim + execute a queued job. This is the link the
+ * plan requires (M8 worker → POST /api/jobs/run): the webhook only ENQUEUES
+ * ({accepted, jobId}); nothing in the platform runs the engine on its own, so
+ * the queue would sit `queued` forever and the poll below would burn its whole
+ * budget before the fallback fired. We fire the claim from the connected
+ * session that owns the turn. Returns true when the run route accepted the
+ * request (job was claimed or already finalised server-side).
+ */
+async function triggerJobRun(
+  restaurantId: string,
+  jobId: string,
+  timeoutMs: number
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${PLATFORM_URL}/api/jobs/run`, {
+      method: "POST",
+      headers: platformHeaders(),
+      body: JSON.stringify({ restaurantId, jobId }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) {
+      logger.warn(`jobs/run returned ${res.status} for ${jobId} — will keep polling`);
+      return false;
+    }
+    const data = (await res.json()) as {
+      ok?: boolean;
+      job?: { id?: string; status?: string } | null;
+    };
+    if (data.ok === false) {
+      logger.warn(`jobs/run ok:false for ${jobId} — will keep polling`);
+      return false;
+    }
+    logger.info(
+      `jobs/run executed job ${data.job?.id ?? jobId} (status ${data.job?.status ?? "?"})`
+    );
+    return true;
+  } catch (err) {
+    logger.warn(`jobs/run trigger failed for ${jobId}: ${String(err)} — will keep polling`);
+    return false;
+  }
+}
+
+/**
  * Poll GET /api/jobs/result?jobId= every ~2s up to the poll budget and act on
  * the first terminal status. Transient fetch/HTTP errors are logged and the
  * poll continues — only the deadline decides "give up".
+ *
+ * The trigger fires `/api/jobs/run` once before polling (the queue has no
+ * self-executor), and RE-fires it whenever the job is still `queued` and our
+ * last trigger is stale — so a transient trigger failure can never strand the
+ * job until the budget expires.
  */
 async function deliverJob(
   restaurantId: string,
@@ -261,9 +309,16 @@ async function deliverJob(
   jobId: string
 ): Promise<boolean> {
   const deadline = Date.now() + pollBudgetMs;
+  let lastRunTriggerAt = 0;
   while (Date.now() < deadline) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
+
+    // Ensure the platform is actually executing our job — fire the claim every
+    // time the job is still queued (or we couldn't confirm a status) and the
+    // previous trigger is older than one poll interval, so a dropped trigger
+    // or network blip self-heals instead of stranding the job.
+    const shouldReTrigger = { value: true };
     try {
       const res = await fetch(
         `${PLATFORM_URL}/api/jobs/result?jobId=${encodeURIComponent(jobId)}`,
@@ -284,6 +339,11 @@ async function deliverJob(
           );
         } else {
           const status = data.status ?? "";
+          // Only "processing" (or "sending") proves the platform owns the job
+          // right now; anything else (queued, empty, indeterminate) may still
+          // need the trigger to claim it.
+          shouldReTrigger.value =
+            status !== "processing" && status !== "sending";
           if (status === "ready") return await handleReady(restaurantId, remoteJid, jobId, data.result ?? {});
           if (status === "sent") {
             logger.info(`deliver: job ${jobId} already sent (acked by another path)`);
@@ -301,7 +361,7 @@ async function deliverJob(
             await ackJob(jobId, { expired: true }); // never resend this failed job
             return true;
           }
-          // queued / processing / sending (or an error-less unknown) → keep polling
+          // processing / sending (or an error-less unknown) → keep polling
         }
       }
     } catch (err) {
@@ -309,6 +369,12 @@ async function deliverJob(
         `deliver: jobs/result poll threw for ${jobId}: ${String(err)} — keep polling`
       );
     }
+
+    if (shouldReTrigger.value && Date.now() - lastRunTriggerAt >= pollIntervalMs) {
+      lastRunTriggerAt = Date.now();
+      await triggerJobRun(restaurantId, jobId, Math.max(5_000, pollIntervalMs * 2));
+    }
+
     await sleep(pollIntervalMs);
   }
 
