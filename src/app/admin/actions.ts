@@ -10,6 +10,7 @@ import { buildSystemPrompt } from "@/lib/agent/prompt";
 import { adminCookieMaxAge, adminCookieValue, isAdmin } from "@/lib/auth";
 import { newId, randomToken } from "@/lib/utils";
 import { first } from "@/lib/db/query";
+import { withQueryTimeout } from "@/lib/db/reliability";
 import {
   deleteTelegramWebhook,
   getTelegramBotUsername,
@@ -52,22 +53,26 @@ export async function createRestaurant(formData: FormData) {
 
   const id = newId();
   const now = new Date();
-  await db
-    .insert(restaurants)
-    .values({
-      id,
-      name,
-      createdAt: now,
-      agentEnabled: true,
-    });
-  await db
-    .insert(agentConfigs)
-    .values({
-      id: newId(),
-      restaurantId: id,
-      businessName: name,
-      updatedAt: now,
-    });
+  await withQueryTimeout(
+    db
+      .insert(restaurants)
+      .values({
+        id,
+        name,
+        createdAt: now,
+        agentEnabled: true,
+      })
+  );
+  await withQueryTimeout(
+    db
+      .insert(agentConfigs)
+      .values({
+        id: newId(),
+        restaurantId: id,
+        businessName: name,
+        updatedAt: now,
+      })
+  );
   revalidatePath("/admin/restaurants");
   redirect(`/admin/restaurants/${id}?tab=agent`);
 }
@@ -75,13 +80,21 @@ export async function createRestaurant(formData: FormData) {
 export async function saveAgentConfig(formData: FormData) {
   await guard();
   const restaurantId = String(formData.get("restaurantId"));
-  const restaurant = await first(
-    db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
-  );
+  // Two independent reads fired in parallel — one cross-region RTT instead of
+  // a sequential 2×RTT waterfall on every agent-tab save.
+  const [restaurant, existing] = await Promise.all([
+    first(
+      withQueryTimeout(
+        db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
+      )
+    ),
+    first(
+      withQueryTimeout(
+        db.select().from(agentConfigs).where(eq(agentConfigs.restaurantId, restaurantId))
+      )
+    ),
+  ]);
   if (!restaurant) return;
-  const existing = await first(
-    db.select().from(agentConfigs).where(eq(agentConfigs.restaurantId, restaurantId))
-  );
 
   const update: Partial<typeof agentConfigs.$inferInsert> = {
     businessName: String(formData.get("businessName") ?? "").trim(),
@@ -118,14 +131,18 @@ export async function saveAgentConfig(formData: FormData) {
   merged.systemPrompt = buildSystemPrompt({ restaurant, config: merged });
 
   if (existing) {
-    await db
-      .update(agentConfigs)
-      .set({ ...update, systemPrompt: merged.systemPrompt })
-      .where(eq(agentConfigs.restaurantId, restaurantId));
+    await withQueryTimeout(
+      db
+        .update(agentConfigs)
+        .set({ ...update, systemPrompt: merged.systemPrompt })
+        .where(eq(agentConfigs.restaurantId, restaurantId))
+    );
   } else {
-    await db
-      .insert(agentConfigs)
-      .values({ id: newId(), restaurantId, ...update, systemPrompt: merged.systemPrompt });
+    await withQueryTimeout(
+      db
+        .insert(agentConfigs)
+        .values({ id: newId(), restaurantId, ...update, systemPrompt: merged.systemPrompt })
+    );
   }
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
@@ -133,19 +150,27 @@ export async function saveAgentConfig(formData: FormData) {
 export async function regeneratePrompt(formData: FormData) {
   await guard();
   const restaurantId = String(formData.get("restaurantId"));
-  const config = await first(
-    db.select().from(agentConfigs).where(eq(agentConfigs.restaurantId, restaurantId))
-  );
+  const [config, restaurant] = await Promise.all([
+    first(
+      withQueryTimeout(
+        db.select().from(agentConfigs).where(eq(agentConfigs.restaurantId, restaurantId))
+      )
+    ),
+    first(
+      withQueryTimeout(
+        db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
+      )
+    ),
+  ]);
   if (!config) return;
-  const restaurant = await first(
-    db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
-  );
   if (!restaurant) return;
   const prompt = buildSystemPrompt({ restaurant, config });
-  await db
-    .update(agentConfigs)
-    .set({ systemPrompt: prompt, updatedAt: new Date() })
-    .where(eq(agentConfigs.restaurantId, restaurantId));
+  await withQueryTimeout(
+    db
+      .update(agentConfigs)
+      .set({ systemPrompt: prompt, updatedAt: new Date() })
+      .where(eq(agentConfigs.restaurantId, restaurantId))
+  );
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 
@@ -153,7 +178,9 @@ export async function toggleAgent(formData: FormData) {
   await guard();
   const restaurantId = String(formData.get("restaurantId"));
   const restaurant = await first(
-    db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
+    withQueryTimeout(
+      db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
+    )
   );
   if (!restaurant) return;
   const next = restaurant.agentEnabled ? false : true;
@@ -161,7 +188,9 @@ export async function toggleAgent(formData: FormData) {
   if (next && !restaurant.activatedAt) {
     data.activatedAt = new Date();
   }
-  await db.update(restaurants).set(data).where(eq(restaurants.id, restaurantId));
+  await withQueryTimeout(
+    db.update(restaurants).set(data).where(eq(restaurants.id, restaurantId))
+  );
   revalidatePath(`/admin/restaurants/${restaurantId}`);
   revalidatePath("/admin/restaurants");
   revalidatePath("/admin");
@@ -171,14 +200,16 @@ export async function generateLink(formData: FormData) {
   await guard();
   const restaurantId = String(formData.get("restaurantId"));
   const token = randomToken();
-  await db
-    .update(restaurants)
-    .set({
-      linkToken: token,
-      whatsappStatus: "waiting",
-      instagramStatus: "waiting",
-    })
-    .where(eq(restaurants.id, restaurantId));
+  await withQueryTimeout(
+    db
+      .update(restaurants)
+      .set({
+        linkToken: token,
+        whatsappStatus: "waiting",
+        instagramStatus: "waiting",
+      })
+      .where(eq(restaurants.id, restaurantId))
+  );
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 
@@ -190,32 +221,36 @@ export async function connectInstagram(formData: FormData) {
   const accessToken = String(formData.get("accessToken") ?? "").trim();
   if (!igId || !accessToken) throw new Error("Instagram account ID and access token are required.");
 
-  await db
-    .update(restaurants)
-    .set({
-      instagramIgId: igId,
-      instagramUsername: username || null,
-      instagramToken: accessToken,
-      instagramLinked: true,
-      instagramStatus: "connected",
-    })
-    .where(eq(restaurants.id, restaurantId));
+  await withQueryTimeout(
+    db
+      .update(restaurants)
+      .set({
+        instagramIgId: igId,
+        instagramUsername: username || null,
+        instagramToken: accessToken,
+        instagramLinked: true,
+        instagramStatus: "connected",
+      })
+      .where(eq(restaurants.id, restaurantId))
+  );
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 
 export async function disconnectInstagram(formData: FormData) {
   await guard();
   const restaurantId = String(formData.get("restaurantId"));
-  await db
-    .update(restaurants)
-    .set({
-      instagramIgId: null,
-      instagramUsername: null,
-      instagramToken: null,
-      instagramLinked: false,
-      instagramStatus: "disconnected",
-    })
-    .where(eq(restaurants.id, restaurantId));
+  await withQueryTimeout(
+    db
+      .update(restaurants)
+      .set({
+        instagramIgId: null,
+        instagramUsername: null,
+        instagramToken: null,
+        instagramLinked: false,
+        instagramStatus: "disconnected",
+      })
+      .where(eq(restaurants.id, restaurantId))
+  );
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 
@@ -233,7 +268,9 @@ export async function saveTelegramBot(formData: FormData) {
   }
 
   const existing = await first(
-    db.select().from(telegramBots).where(eq(telegramBots.restaurantId, restaurantId))
+    withQueryTimeout(
+      db.select().from(telegramBots).where(eq(telegramBots.restaurantId, restaurantId))
+    )
   );
   const webhookSecret = existing?.webhookSecret || randomToken();
   const webhook = await setTelegramWebhook(botToken, webhookSecret, restaurantId);
@@ -246,26 +283,30 @@ export async function saveTelegramBot(formData: FormData) {
   }
 
   if (existing) {
-    await db
-      .update(telegramBots)
-      .set({
+    await withQueryTimeout(
+      db
+        .update(telegramBots)
+        .set({
+          botToken,
+          webhookSecret,
+          botUsername: info.username ?? null,
+          enabled: true,
+          updatedAt: new Date(),
+        })
+        .where(eq(telegramBots.restaurantId, restaurantId))
+    );
+  } else {
+    await withQueryTimeout(
+      db.insert(telegramBots).values({
+        id: newId(),
+        restaurantId,
         botToken,
         webhookSecret,
         botUsername: info.username ?? null,
+        chatId: null,
         enabled: true,
-        updatedAt: new Date(),
       })
-      .where(eq(telegramBots.restaurantId, restaurantId));
-  } else {
-    await db.insert(telegramBots).values({
-      id: newId(),
-      restaurantId,
-      botToken,
-      webhookSecret,
-      botUsername: info.username ?? null,
-      chatId: null,
-      enabled: true,
-    });
+    );
   }
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
@@ -274,12 +315,16 @@ export async function removeTelegramBot(formData: FormData) {
   await guard();
   const restaurantId = String(formData.get("restaurantId"));
   const existing = await first(
-    db.select().from(telegramBots).where(eq(telegramBots.restaurantId, restaurantId))
+    withQueryTimeout(
+      db.select().from(telegramBots).where(eq(telegramBots.restaurantId, restaurantId))
+    )
   );
   if (existing?.botToken) {
     await deleteTelegramWebhook(existing.botToken).catch(() => {});
   }
-  await db.delete(telegramBots).where(eq(telegramBots.restaurantId, restaurantId));
+  await withQueryTimeout(
+    db.delete(telegramBots).where(eq(telegramBots.restaurantId, restaurantId))
+  );
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 
@@ -294,17 +339,19 @@ export async function setOrderStatus(formData: FormData) {
     | "declined";
   const allowed = ["new", "pinned", "preparing", "done", "declined"] as const;
   if (!allowed.includes(status)) return;
-  await db.update(orders).set({ status }).where(eq(orders.id, orderId));
+  await withQueryTimeout(db.update(orders).set({ status }).where(eq(orders.id, orderId)));
   revalidatePath(`/admin/restaurants/${String(formData.get("restaurantId") ?? "")}?tab=orders`);
 }
 
 export async function resolveError(formData: FormData) {
   await guard();
   const errorId = String(formData.get("errorId"));
-  await db
-    .update(errorLogs)
-    .set({ resolved: true })
-    .where(eq(errorLogs.id, errorId));
+  await withQueryTimeout(
+    db
+      .update(errorLogs)
+      .set({ resolved: true })
+      .where(eq(errorLogs.id, errorId))
+  );
   revalidatePath(`/admin/restaurants/${String(formData.get("restaurantId") ?? "")}?tab=errors`);
 }
 
@@ -333,13 +380,15 @@ const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 export async function saveMenuPrefs(formData: FormData) {
   await guard();
   const restaurantId = String(formData.get("restaurantId"));
-  await db
-    .update(restaurants)
-    .set({
-      autoMenuWhatsapp: formData.get("autoMenuWhatsapp") === "on",
-      autoMenuInstagram: formData.get("autoMenuInstagram") === "on",
-    })
-    .where(eq(restaurants.id, restaurantId));
+  await withQueryTimeout(
+    db
+      .update(restaurants)
+      .set({
+        autoMenuWhatsapp: formData.get("autoMenuWhatsapp") === "on",
+        autoMenuInstagram: formData.get("autoMenuInstagram") === "on",
+      })
+      .where(eq(restaurants.id, restaurantId))
+  );
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 
@@ -347,7 +396,9 @@ export async function addMenuImages(formData: FormData) {
   await guard();
   const restaurantId = String(formData.get("restaurantId"));
   const restaurant = await first(
-    db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
+    withQueryTimeout(
+      db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
+    )
   );
   if (!restaurant) return;
 
@@ -368,10 +419,12 @@ export async function addMenuImages(formData: FormData) {
   }
   if (added.length === 0) return;
 
-  await db
-    .update(restaurants)
-    .set({ menuImages: JSON.stringify([...current, ...added]) })
-    .where(eq(restaurants.id, restaurantId));
+  await withQueryTimeout(
+    db
+      .update(restaurants)
+      .set({ menuImages: JSON.stringify([...current, ...added]) })
+      .where(eq(restaurants.id, restaurantId))
+  );
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }
 
@@ -380,14 +433,18 @@ export async function removeMenuImage(formData: FormData) {
   const restaurantId = String(formData.get("restaurantId"));
   const index = Number(formData.get("index"));
   const restaurant = await first(
-    db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
+    withQueryTimeout(
+      db.select().from(restaurants).where(eq(restaurants.id, restaurantId))
+    )
   );
   if (!restaurant) return;
   const current = parseMenuImages(restaurant.menuImages);
   if (!Number.isInteger(index) || index < 0 || index >= current.length) return;
-  await db
-    .update(restaurants)
-    .set({ menuImages: JSON.stringify(current.filter((_, i) => i !== index)) })
-    .where(eq(restaurants.id, restaurantId));
+  await withQueryTimeout(
+    db
+      .update(restaurants)
+      .set({ menuImages: JSON.stringify(current.filter((_, i) => i !== index)) })
+      .where(eq(restaurants.id, restaurantId))
+  );
   revalidatePath(`/admin/restaurants/${restaurantId}`);
 }

@@ -1,5 +1,13 @@
 import { SCHEMA_DDL } from "./ddl";
 import { rawClient } from "./raw";
+import { JOBS_DDL } from "@/lib/ddl/jobs";
+import { VISION_DDL } from "@/lib/ddl/vision";
+import { INGEST_DDL } from "@/lib/ddl/ingest";
+import { STATE_DDL } from "@/lib/ddl/state";
+import { RELIABILITY_DDL } from "@/lib/ddl/reliability";
+import { AI_DDL } from "@/lib/ddl/ai";
+import { MONITORING_DDL } from "@/lib/ddl/monitoring";
+import { ADMIN_DDL } from "@/lib/ddl/admin";
 
 let initialized: Promise<void> | null = null;
 
@@ -58,12 +66,41 @@ CREATE TABLE IF NOT EXISTS "repli"."conversation_locks" (
 CREATE INDEX IF NOT EXISTS "conversation_locks_expires_idx" ON "repli"."conversation_locks" ("expires_at");
 `;
 
+// Module DDL additions (Phase 2 workers, additive + idempotent). Each module
+// exports an array of single statements; they are splatted into the post-
+// baseline stream below so every new schema object reaches production on the
+// next cold start exactly like the hand-written additions above.
+const MODULE_DDL: string[] = [
+  ...JOBS_DDL,
+  ...VISION_DDL,
+  ...INGEST_DDL,
+  ...STATE_DDL,
+  ...RELIABILITY_DDL,
+  ...AI_DDL,
+  ...MONITORING_DDL,
+  ...ADMIN_DDL,
+];
+
 async function applyStatements(statements: string): Promise<void> {
   const parts = statements
     .split("--> statement-breakpoint")
     .map((s) => s.trim())
     .filter(Boolean);
   for (const stmt of parts) {
+    try {
+      await rawClient.unsafe(stmt);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!/already exists/i.test(msg)) {
+        throw err;
+      }
+    }
+  }
+}
+
+/** Applies the module DDL arrays (single statements each) idempotently. */
+async function applyModuleStatements(): Promise<void> {
+  for (const stmt of MODULE_DDL) {
     try {
       await rawClient.unsafe(stmt);
     } catch (err) {
@@ -101,6 +138,7 @@ export function migrateNow(): Promise<void> {
 
       // Always-idempotent additions (indexes/columns added after baseline).
       await applyStatements(POST_BASELINE_DDL);
+      await applyModuleStatements();
 
       if (!baselineApplied) {
         await rawClient.unsafe(`

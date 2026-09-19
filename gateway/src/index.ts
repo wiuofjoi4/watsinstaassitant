@@ -1,24 +1,42 @@
 import express from "express";
 import {
   Browsers,
-  DisconnectReason,
-  downloadMediaMessage,
-  getContentType,
   makeWASocket,
   type WASocket,
 } from "@whiskeysockets/baileys";
 import postgres from "postgres";
-import pino from "pino";
 import qrcode from "qrcode";
 import { PgAuthState } from "./auth";
+import { logger } from "./logger";
+import { handleMessage } from "./parse";
+import { deliver, sendFallback } from "./deliver";
+import { FallbackReplies } from "./deliver";
+import { createHealthHandler } from "./routes/health";
+import { startOutboxLoop, cancelOutboxLoop } from "./queueClient";
+import {
+  isDuplicateMessage,
+  isRateLimited,
+  recordClose,
+  sessions,
+  noteConnectionFailure,
+  noteConnectionSuccess,
+  getReconnectGate,
+  consumePauseWarning,
+  emitSessionOpen,
+  emitSessionClose,
+  type Session,
+} from "./conn/state";
+import {
+  shouldRetryAfterDisconnect,
+  getReconnectStats,
+  type ReconnectReason,
+} from "./conn/backoff";
 
 const PORT = Number(process.env.PORT ?? 4000);
 const PLATFORM_URL = process.env.PLATFORM_URL ?? "http://localhost:3000";
 const GATEWAY_SECRET = process.env.GATEWAY_SECRET ?? "dev-secret";
 const DATABASE_URL = process.env.DATABASE_URL ?? "";
 const SYNC_INTERVAL_MS = Number(process.env.SYNC_INTERVAL_MS ?? 15000);
-
-const logger = pino({ level: process.env.LOG_LEVEL ?? "info" });
 
 // ---------------------------------------------------------------------------
 // Env guard — fail loud at boot in production when critical config is missing
@@ -63,115 +81,6 @@ const sql = DATABASE_URL
       connect_timeout: 10,
     })
   : null;
-
-interface Session {
-  socket: WASocket;
-  restaurantId: string;
-  auth: PgAuthState;
-  qr: string | null;
-  connected: boolean;
-  lastJid: string | null;
-  startedAt: number;
-  connectionState?: string;
-  lastError?: string;
-  qrOnce?: boolean;
-  /** Presence heartbeat timer — keeps the WhatsApp socket alive server-side so
-   * the device line is not silently dropped (error 408 / forced re-pair). */
-  heartbeat?: NodeJS.Timeout;
-}
-
-const sessions = new Map<string, Session>();
-
-interface RecentEvent {
-  at: string;
-  connection?: string;
-  errorCode?: number;
-  error?: string;
-}
-const recent = new Map<string, RecentEvent>();
-
-// ---------------------------------------------------------------------------
-// Rate limiter — per remoteJid, sliding window
-// ---------------------------------------------------------------------------
-const RATE_LIMIT_MAX = 15; // messages per window
-const RATE_LIMIT_WINDOW_MS = 60_000; // 60 seconds
-const rateLimitBuckets = new Map<string, number[]>();
-
-function isRateLimited(remoteJid: string): boolean {
-  const now = Date.now();
-  const windowStart = now - RATE_LIMIT_WINDOW_MS;
-  let timestamps = rateLimitBuckets.get(remoteJid);
-  if (!timestamps) {
-    timestamps = [];
-    rateLimitBuckets.set(remoteJid, timestamps);
-  }
-  // Drop timestamps outside the window
-  while (timestamps.length > 0 && timestamps[0] <= windowStart) {
-    timestamps.shift();
-  }
-  if (timestamps.length >= RATE_LIMIT_MAX) {
-    return true;
-  }
-  timestamps.push(now);
-  return false;
-}
-
-// Periodic cleanup: every 2 minutes drop buckets with no recent activity.
-// Prevents unbounded memory growth when many customers message once and leave.
-setInterval(() => {
-  const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS * 2;
-  for (const [jid, ts] of rateLimitBuckets) {
-    if (ts.length === 0 || ts[ts.length - 1] < cutoff) {
-      rateLimitBuckets.delete(jid);
-    }
-  }
-}, 120_000);
-
-// ---------------------------------------------------------------------------
-// Message deduplication — in-memory, per message.key.id
-// WhatsApp sometimes re-delivers the same message event. This prevents
-// double-processing (double AI call, double reply).
-// Safe in single-instance gateway (Render). Would need a shared store
-// (DB table or Redis) if the gateway ever runs multi-instance.
-// ---------------------------------------------------------------------------
-const DEDUP_TTL_MS = 15 * 60_000; // keep seen IDs for 15 minutes
-const seenMessageIds = new Map<string, number>(); // key.id → timestamp
-
-function isDuplicateMessage(keyId: string): boolean {
-  const now = Date.now();
-  const prev = seenMessageIds.get(keyId);
-  if (prev !== undefined && now - prev < DEDUP_TTL_MS) {
-    return true; // already processed recently
-  }
-  seenMessageIds.set(keyId, now);
-  return false;
-}
-
-// Merge cleanup with the rate-limiter interval (runs every 2 minutes).
-// Entries older than DEDUP_TTL_MS are dropped. Overwritten below so both
-// maps are cleaned in the same timer tick.
-setInterval(() => {
-  const cutoff = Date.now() - DEDUP_TTL_MS;
-  for (const [id, ts] of seenMessageIds) {
-    if (ts < cutoff) seenMessageIds.delete(id);
-  }
-}, 120_000);
-
-function recordClose(restaurantId: string, connection: string | undefined, lastDisconnect?: unknown): void {
-  const errObj = lastDisconnect as { error?: { output?: { statusCode?: number }; message?: string; stack?: string }; message?: string } | null;
-  const code = errObj?.error?.output?.statusCode;
-  const errText =
-    errObj?.error?.message ??
-    errObj?.error?.stack?.split("\n")[0] ??
-    errObj?.message ??
-    (errObj?.error ? JSON.stringify(errObj.error).slice(0, 400) : null);
-  recent.set(restaurantId, {
-    at: new Date().toISOString(),
-    connection,
-    errorCode: code,
-    error: errText ?? undefined,
-  });
-}
 
 function headers(): Record<string, string> {
   return {
@@ -263,7 +172,39 @@ function ensureSession(restaurantId: string): void {
 // whole line down. Only one creation attempt may be in flight at a time.
 const starting = new Set<string>();
 
+// Pending reconnect timers (one per restaurant). startSession defers itself
+// when conn/state says the restaurant is still in backoff; this map dedupes so
+// the 15s sync loop and the close handler can't stack duplicate restarts.
+const restartTimers = new Map<string, NodeJS.Timeout>();
+
 async function startSession(restaurantId: string): Promise<void> {
+  // GATE: honor the reconnect tracker before creating a socket. A restaurant
+  // paused after MAX_CONSECUTIVE_FAILURES is held until pausedUntil passes
+  // (logged once, never silently dropped); a deferred one is re-scheduled for
+  // its backoff time and never started early.
+  const gate = getReconnectGate(restaurantId);
+  if (gate.kind === "paused") {
+    if (consumePauseWarning(restaurantId)) {
+      logger.error(
+        `[RECONNECT] ${restaurantId} is paused until ` +
+          `${new Date(gate.pausedUntil).toISOString()} (` +
+          `${getReconnectStats(restaurantId)?.consecutiveFails ?? "?"} consecutive ` +
+          "failures) — auto-reconnect held. It resumes when the pause expires."
+      );
+    }
+    return;
+  }
+  if (gate.kind === "deferred") {
+    const existing = restartTimers.get(restaurantId);
+    if (existing) return; // already scheduled — sync loop and close can race
+    const wait = Math.max(0, gate.until - Date.now());
+    const t = setTimeout(() => {
+      if (restartTimers.get(restaurantId) === t) restartTimers.delete(restaurantId);
+      void startSession(restaurantId);
+    }, wait);
+    restartTimers.set(restaurantId, t);
+    return;
+  }
   if (starting.has(restaurantId)) return;
   starting.add(restaurantId);
   try {
@@ -292,7 +233,10 @@ async function startSessionInner(restaurantId: string): Promise<void> {
     });
   } catch (err) {
     logger.error(`makeWASocket threw for ${restaurantId}: ${String(err)}`);
-    setTimeout(() => startSession(restaurantId), 10_000);
+    // Route through the reconnect tracker so socket-throw obeys the backoff
+    // policy (base 10s, growing) and honors a pause. Not a hardcoded 10s.
+    noteConnectionFailure(restaurantId, "socket-throw", null);
+    void startSession(restaurantId);
     return;
   }
 
@@ -329,6 +273,14 @@ async function startSessionInner(restaurantId: string): Promise<void> {
       void postStatus(restaurantId, "qr_ready");
     }
     if (connection === "open") {
+      // A successfully connected socket means the failure streak is over —
+      // clear any pending restart and reset the reconnect tracker.
+      const pendingRestart = restartTimers.get(restaurantId);
+      if (pendingRestart) {
+        clearTimeout(pendingRestart);
+        restartTimers.delete(restaurantId);
+      }
+      noteConnectionSuccess(restaurantId);
       session.connected = true;
       session.qr = null;
       const jid = socket.user?.id ?? null;
@@ -345,6 +297,7 @@ async function startSessionInner(restaurantId: string): Promise<void> {
       }, 120_000);
       session.heartbeat.unref?.();
       void postStatus(restaurantId, "connected", jid);
+      emitSessionOpen(restaurantId);
     }
     if (connection === "close") {
       session.connected = false;
@@ -353,25 +306,41 @@ async function startSessionInner(restaurantId: string): Promise<void> {
         session.heartbeat = undefined;
       }
       recordClose(restaurantId, connection, lastDisconnect);
-      void postStatus(restaurantId, "disconnected");
       sessions.delete(restaurantId);
       void session.socket.end(undefined);
+      emitSessionClose(restaurantId);
 
+      // Classify the disconnect BEFORE deciding whether stored creds survive.
+      // A logged-out / bad-session code means the pairing itself is dead →
+      // discard creds and present a fresh QR. Everything else (conflict or
+      // replaced 440, connection closed 428, lost/timed-out 408, ...) is a
+      // transport blip → reconnect quietly with creds preserved.
       const code = (lastDisconnect?.error as { output?: { statusCode?: number } } | undefined)
         ?.output?.statusCode;
-      const shouldRetry = code === DisconnectReason.loggedOut ? false : true;
-      if (shouldRetry) {
-        setTimeout(() => startSession(restaurantId), 5_000);
-      } else {
-        // The owner removed the device from WhatsApp → drop stored creds so a
-        // fresh QR is generated for re-pairing.
+      const shouldRetry = shouldRetryAfterDisconnect(code);
+      const reason: ReconnectReason = shouldRetry ? "close-retry" : "logged-out";
+      // Records the failure and computes nextAttemptAt from the backoff policy
+      // (or pauses the restaurant after 10 consecutive failures). startSession
+      // below honors that gate.
+      noteConnectionFailure(restaurantId, reason, code ?? null);
+
+      if (!shouldRetry) {
+        // True unlink / invalid session: drop stored creds so a fresh QR is
+        // generated for re-pairing, and tell the platform the line is down.
+        void postStatus(restaurantId, "disconnected");
         try {
-          void session.auth.discard().then(() => {
-            setTimeout(() => startSession(restaurantId), 2_000);
-          });
+          void session.auth
+            .discard()
+            .catch(() => undefined)
+            .then(() => void startSession(restaurantId));
         } catch {
-          setTimeout(() => startSession(restaurantId), 2_000);
+          void startSession(restaurantId);
         }
+      } else {
+        // Retryable: reconnect on the tracker's nextAttemptAt (startSession
+        // gates itself). No "disconnected" post — the account is still paired
+        // and this is a self-healing blip, not an unlink.
+        void startSession(restaurantId);
       }
     }
   });
@@ -393,7 +362,7 @@ async function startSessionInner(restaurantId: string): Promise<void> {
         await sendFallback(
           restaurantId,
           remoteJid,
-          FALLBACK_REPLY_RATE_LIMIT
+          FallbackReplies.rateLimit
         );
         continue;
       }
@@ -409,7 +378,9 @@ async function startSessionInner(restaurantId: string): Promise<void> {
       try {
         const content = await handleMessage(session, m);
         if (content) {
-          await deliver(restaurantId, remoteJid, content);
+          // M1↔M8 contract: deliver(restaurantId, remoteJid, parsed, messageId?)
+          // — m.key.id is the idempotency key the platform queue dedups on.
+          await deliver(restaurantId, remoteJid, content, msgId ?? undefined);
         }
       } catch (err) {
         logger.error(
@@ -417,286 +388,17 @@ async function startSessionInner(restaurantId: string): Promise<void> {
         );
         // Guarantee the customer still hears something even on an unexpected
         // exception in parsing/delivery for this message.
-        await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
+        await sendFallback(restaurantId, remoteJid, FallbackReplies.generic);
       }
     }
   });
-}
-
-interface ParsedMessage {
-  contentType: "text" | "image" | "voice" | "video";
-  text?: string | null;
-  mediaBase64?: string;
-  mediaMime?: string;
-}
-
-// Graceful fallback replies — Iraqi Arabic dialect, matching the platform's
-// tone. The CUSTOMER never sees a raw error / stack trace: on any failure we
-// send one of these instead of silence.
-const FALLBACK_REPLY_GENERIC =
-  "عذراً صار تعطل بسيط بالخادم، كرر رسالتك بعد دقيقة 🙏";
-const FALLBACK_REPLY_MEDIA_TOO_LARGE =
-  "عذراً، الصورة كبيرة هواية وما قدرت أقراها. أرسل صورة أصغر أو اكتب الوصف بالكلام 🙏";
-const FALLBACK_REPLY_RATE_LIMIT =
-  "تعال شوي رجاءً، وحدة وحدة 🙏";
-
-// Cap this under Vercel's 60s function budget so the abort fires BEFORE the
-// platform lambda is killed. If we wait too long, the platform gets nothing
-// and neither placeholder NOR reply can be sent.
-const PLATFORM_TIMEOUT_MS = 55_000;
-
-// Guard against multi-MB base64 payloads blowing up the webhook request /
-// function memory. WhatsApp images routinely exceed 1MB base64.
-const MAX_MEDIA_BASE64_LENGTH = 4_000_000; // ~3MB binary
-
-/** Best-effort: send a fallback text to the customer if the session is up. */
-async function sendFallback(
-  restaurantId: string,
-  remoteJid: string,
-  text: string
-): Promise<void> {
-  const session = sessions.get(restaurantId);
-  if (!session?.connected) return;
-  try {
-    await session.socket.sendMessage(remoteJid, { text });
-    logger.info(`fallback sent to ${remoteJid} for ${restaurantId}: ${text.slice(0, 40)}`);
-  } catch (err) {
-    logger.error(`fallback send failed for ${restaurantId} ${remoteJid}: ${String(err)}`);
-  }
-}
-
-async function handleMessage(
-  session: Session,
-  m: any
-): Promise<ParsedMessage | null> {
-  try {
-    const msg = m.message;
-    if (!msg) return null;
-    const type = getContentType(msg);
-    if (type === "conversation") return { contentType: "text", text: msg.conversation ?? "" };
-    if (type === "extendedTextMessage")
-      return { contentType: "text", text: msg.extendedTextMessage?.text ?? "" };
-
-    const isImage = type === "imageMessage";
-    const isVideo = type === "videoMessage";
-    const isAudio = type === "audioMessage";
-    if (isImage || isVideo || isAudio) {
-      let buffer: Buffer | undefined;
-      try {
-        buffer = (await downloadMediaMessage(
-          m,
-          "buffer",
-          {},
-          { logger, reuploadRequest: m.upload }
-        )) as Buffer | undefined;
-      } catch (err) {
-        logger.warn(`media download failed: ${String(err)}`);
-      }
-      const mime =
-        msg[type]?.mimetype ??
-        (isImage ? "image/jpeg" : isAudio ? "audio/ogg" : "video/mp4");
-      if (buffer && buffer.length > 0) {
-        return {
-          contentType: isImage ? "image" : isAudio ? "voice" : "video",
-          mediaBase64: buffer.toString("base64"),
-          mediaMime: mime,
-          text: null,
-        };
-      }
-      return {
-        contentType: isImage ? "image" : isAudio ? "voice" : "video",
-        text: isImage ? "[image]" : isAudio ? "[voice]" : "[video]",
-      };
-    }
-    return { contentType: "text", text: JSON.stringify(msg) };
-  } catch (err) {
-    logger.error(`handleMessage error: ${String(err)}`);
-    return null;
-  }
-}
-
-async function deliver(
-  restaurantId: string,
-  remoteJid: string,
-  parsed: ParsedMessage
-): Promise<boolean> {
-  try {
-    // Over-sized media would blow the webhook request / function memory and
-    // produce a silent failure. Reject it up-front with a graceful message.
-    if (
-      parsed.mediaBase64 &&
-      parsed.mediaBase64.length > MAX_MEDIA_BASE64_LENGTH
-    ) {
-      logger.warn(
-        `media too large (${parsed.mediaBase64.length} base64 chars) for ${restaurantId}/${remoteJid}`
-      );
-      await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_MEDIA_TOO_LARGE);
-      return false;
-    }
-
-    // Show a typing indicator right away so the customer knows the bot is
-    // working — this is a cheap, near-instant signal while the platform LLM
-    // call runs.
-    try {
-      const session = sessions.get(restaurantId);
-      if (session?.connected) {
-        await session.socket.sendPresenceUpdate("composing", remoteJid);
-      }
-    } catch {
-      // Typing indicator is best-effort — never fail the turn over it.
-    }
-
-    const res = await fetch(`${PLATFORM_URL}/api/webhooks/message`, {
-      method: "POST",
-      headers: headers(),
-      body: JSON.stringify({
-        restaurantId,
-        channel: "whatsapp",
-        remoteJid,
-        contentType: parsed.contentType,
-        text: parsed.text,
-        mediaBase64: parsed.mediaBase64,
-        mediaMime: parsed.mediaMime,
-      }),
-      // Vercel kills the webhook at 60s — never let this call hang past it so
-      // we can log cleanly and the platform's next message doesn't queue up.
-      // We MUST abort and send a fallback before the lambda is killed, or the
-      // customer gets silence (root cause of silent failures).
-      signal: AbortSignal.timeout(PLATFORM_TIMEOUT_MS),
-    });
-    if (!res.ok) {
-      logger.error(`webhook message returned ${res.status} for ${restaurantId}`);
-      await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
-      return false;
-    }
-    const data = (await res.json()) as {
-      reply?: { text?: string; parts?: string[] } | null;
-      images?: Array<{ base64?: string; mime?: string }>;
-      silent?: boolean;
-    };
-    // A "silent" turn (human currently handling this chat in the dashboard)
-    // deliberely requires NO bot reply — do not auto-fallback over the human.
-    if (data.silent === true) return false;
-    const replyText = data.reply?.text;
-    const replyParts = Array.isArray(data.reply?.parts)
-      ? data.reply!.parts!.filter((p) => p && p.trim().length > 0)
-      : [];
-    const session = sessions.get(restaurantId);
-    if (!session?.connected) {
-      // Session dropped (WhatsApp disconnect) — nothing to send to. Still log.
-      logger.warn(
-        `deliver: no connected session for ${restaurantId} (${remoteJid}) ${Date.now()}`
-      );
-      return false;
-    }
-
-    // Human-like pacing (style guide §5): 2-5s natural "typing" delay before
-    // the first message, and a short pause between split parts.
-    const typingDelay = 2000 + Math.floor(Math.random() * 3000);
-    await new Promise((r) => setTimeout(r, typingDelay));
-
-    // Send images one at a time; a failure on one image must NOT prevent the
-    // text (the main reply) from going out.
-    let imagesSent = false;
-    for (const img of data.images ?? []) {
-      if (!img.base64) continue;
-      const buf = Buffer.from(img.base64, "base64");
-      if (buf.length === 0) continue;
-      try {
-        await session.socket.sendMessage(remoteJid, {
-          image: buf,
-          mimetype: img.mime ?? "image/jpeg",
-        });
-        imagesSent = true;
-      } catch (err) {
-        logger.error(
-          `deliver: image send failed for ${restaurantId}/${remoteJid}: ${String(err)}`
-        );
-      }
-    }
-
-    // Send the reply as a natural short sequence: either the split parts (each
-    // with a pause between, like a person typing while they think) or the
-    // single text when the reply was short.
-    let textSent = false;
-    const texts = replyParts.length > 0 ? replyParts : replyText ? [replyText] : [];
-    for (let i = 0; i < texts.length; i++) {
-      const t = texts[i];
-      if (!t || t.trim().length === 0) continue;
-      try {
-        await session.socket.sendMessage(remoteJid, { text: t });
-        textSent = true;
-      } catch (err) {
-        logger.error(
-          `deliver: reply send failed for ${restaurantId}/${remoteJid}: ${String(err)}`
-        );
-        // The text send itself failed — make sure the customer still gets a
-        // graceful notice rather than silence.
-        await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
-        return false;
-      }
-      if (i < texts.length - 1) {
-        await new Promise((r) =>
-          setTimeout(r, 1200 + Math.floor(Math.random() * 1200))
-        );
-      }
-    }
-    if (textSent) return true;
-
-    if (!imagesSent) {
-      // Platform said OK but produced neither text nor images (e.g. restaurant
-      // not found / agent disabled). We promised to always reply — send the
-      // graceful fallback instead of the silent black hole.
-      await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    logger.error(
-      `deliver failed for ${restaurantId}/${remoteJid}: ${String(err)}`
-    );
-    await sendFallback(restaurantId, remoteJid, FALLBACK_REPLY_GENERIC);
-    return false;
-  }
 }
 
 // --- HTTP server: QR endpoint + health ---
 const app = express();
 app.use(express.json());
 
-app.get("/health", async (_req, res) => {
-  let db = "ok";
-  if (sql) {
-    try {
-      await sql`select 1`;
-    } catch {
-      db = "down";
-    }
-  }
-  res.json({
-    ok: db === "ok",
-    db,
-    sessions: sessions.size,
-    connected: [...sessions.values()].filter((s) => s.connected).length,
-    uptime: Math.round(process.uptime()),
-    states: [...sessions.values()].map((s) => ({
-      restaurantId: s.restaurantId,
-      connection: s.connectionState ?? "pending",
-      hasQr: !!s.qr,
-      qrOnce: !!s.qrOnce,
-      connected: s.connected,
-      ageSeconds: Math.round((Date.now() - s.startedAt) / 1000),
-      lastError: s.lastError ?? null,
-    })),
-    recent: [...recent.entries()].map(([restaurantId, ev]) => ({
-      restaurantId,
-      at: ev.at,
-      connection: ev.connection ?? null,
-      errorCode: ev.errorCode ?? null,
-      error: ev.error ?? null,
-    })),
-  });
-});
+app.get("/health", createHealthHandler({ getSql: () => sql }));
 
 app.get("/qr/:restaurantId/whatsapp", async (req, res) => {
   const session = sessions.get(req.params.restaurantId);
@@ -780,6 +482,11 @@ async function loop() {
         // platform says no longer linked/waiting → stop quietly
         const s = sessions.get(r.id);
         if (s) {
+          const pending = restartTimers.get(r.id);
+          if (pending) {
+            clearTimeout(pending);
+            restartTimers.delete(r.id);
+          }
           try {
             void s.auth.discard();
             s.socket.end(undefined);
@@ -794,6 +501,9 @@ async function loop() {
 
 async function shutdown(): Promise<void> {
   logger.info("shutting down");
+  cancelOutboxLoop();
+  for (const t of restartTimers.values()) clearTimeout(t);
+  restartTimers.clear();
   const flushes = [...sessions.values()].map((s) => s.auth.flush());
   await Promise.allSettled(flushes).catch(() => undefined);
   for (const s of sessions.values()) {
@@ -818,6 +528,7 @@ process.on("uncaughtException", (err) => {
 
 app.listen(PORT, () => {
   logger.info(`Repli gateway listening on :${PORT}`);
+  startOutboxLoop(() => sessions);
   void loop();
   setInterval(() => void loop(), SYNC_INTERVAL_MS);
 });

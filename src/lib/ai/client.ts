@@ -220,13 +220,6 @@ function isTransientError(err: unknown): boolean {
   return /ETIMEDOUT|ECONNRESET|ECONNREFUSED|503|502|500/i.test(text);
 }
 
-function retryDelayMs(err: unknown, fallbackMs: number, capMs: number): number {
-  const text = err instanceof Error ? err.message : String(err);
-  const m = /Please retry in (\d+(?:\.\d+)?)s/i.exec(text);
-  if (m) return Math.min(Math.round(parseFloat(m[1]) * 1000), capMs);
-  return Math.min(fallbackMs, capMs);
-}
-
 // ---------------------------------------------------------------------------
 // Cooldown — per-model cooldown after a quota hit
 // ---------------------------------------------------------------------------
@@ -361,6 +354,152 @@ async function availableGeminiModels(): Promise<string[]> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-key circuit / cooldown (layered inside tryModels below)
+//
+// A key (one comma-separated entry of GEMINI/OPENROUTER/OPENAI_API_KEY) that
+// is invalid, rate-limited at the provider level, or failing repeatedly gets a
+// PER-KEY cooldown so the chain rotates to the next healthy key of the same
+// provider instead of beating the same dead key over and over. State is
+// in-memory per process (matching the existing circuit breaker design; every
+// Vercel instance keeps its own windows). Nothing here ever logs the key
+// itself — only the `provider:index` label.
+//
+// Env knobs:
+//   AI_KEY_COOLDOWN_MS     — how long a 401/403-invalidated key stays
+//                            disabled before rotation. Default 10 minutes.
+//                            Zero/absent → default.
+//   AI_KEY_FAIL_THRESHOLD  — consecutive transient failures (5xx / network
+//                            ECONNRESET / timeout) before a key is auto-cooled
+//                            for 5 minutes. Default 3. Zero/absent → default.
+// ---------------------------------------------------------------------------
+
+const AI_KEY_COOLDOWN_MS = envPositiveInt("AI_KEY_COOLDOWN_MS", 10 * 60_000);
+const AI_KEY_FAIL_THRESHOLD = envPositiveInt("AI_KEY_FAIL_THRESHOLD", 3);
+const KEY_STREAK_COOLDOWN_MS = 5 * 60_000; // cool-down length after a failure streak trips
+const KEY_SHORT_RETRY_MAX_MS = 45_000; // 429 delays below this are "wait & retry once"; at/above = cool the key
+const KEY_LONG_RETRY_CAP_MS = 120_000; // provider-unproductive 429 cooldown cap
+
+const keyCooldownUntil = new Map<KeyLabel, number>(); // label → epoch ms the key becomes healthy again
+const keyFailStreak = new Map<KeyLabel, number>(); // label → consecutive transient failures
+
+function envPositiveInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+/** Redacted key event log — the label carries provider+index only, never the key. */
+function logKeyEvent(label: KeyLabel, msg: string): void {
+  console.error(`[KEY] ${label} — ${msg}`);
+}
+
+/** Scrub anything that looks like a credential from strings bound for logs or
+ * the probe error (OpenAI 401s echo the offending key: "sk-..."; Gemini
+ * validates via a "key=" query param that can surface in fetch errors). */
+function redactSecrets(text: string): string {
+  return text
+    .replace(/(sk-(?:or-)?v1-[0-9A-Za-z_\-]{8,})/g, "[REDACTED]")
+    .replace(/(AIza[0-9A-Za-z_\-]{15,})/g, "[REDACTED]")
+    .replace(/(\bkey=)[A-Za-z0-9._\-]+/g, "$1[REDACTED]");
+}
+
+/**
+ * Applies (or, when `ms` is 0, clears) a per-key cooldown. Thin public helper
+ * also used by the M4 self-test — additive export, nothing in the engine
+ * imports it.
+ */
+export function coolDownKey(label: KeyLabel, ms: number, reason: string): void {
+  if (ms <= 0) {
+    keyCooldownUntil.delete(label);
+    return;
+  }
+  keyCooldownUntil.set(label, Date.now() + ms);
+  logKeyEvent(label, `${reason} — key cooling for ${(ms / 1000).toFixed(0)}s`);
+}
+
+/** Milliseconds until the key is healthy again (0 = healthy). */
+export function keyCooldownMs(label: KeyLabel): number {
+  const until = keyCooldownUntil.get(label);
+  if (until === undefined) return 0;
+  const remain = until - Date.now();
+  if (remain <= 0) {
+    keyCooldownUntil.delete(label);
+    return 0;
+  }
+  return remain;
+}
+
+/** True while the key is on per-key cooldown and must be rotated past. */
+export function isKeyCooling(label: KeyLabel): boolean {
+  return keyCooldownMs(label) > 0;
+}
+
+/** A successful response on this key — resets the transient-failure streak. */
+export function noteKeySuccess(label: KeyLabel): void {
+  keyFailStreak.delete(label);
+}
+
+/** A transient failure (5xx/timeout) on this key — auto-cool at threshold. */
+export function noteKeyFailure(label: KeyLabel): void {
+  const next = (keyFailStreak.get(label) ?? 0) + 1;
+  if (next >= AI_KEY_FAIL_THRESHOLD) {
+    keyFailStreak.delete(label);
+    coolDownKey(label, KEY_STREAK_COOLDOWN_MS, "failure streak");
+  } else {
+    keyFailStreak.set(label, next);
+  }
+}
+
+/** Healthy keys in PROVIDER_PRIORITY order, excluding per-key cooldowns. */
+export function rotationOrder(): KeyLabel[] {
+  const poolKeys = getPoolKeys();
+  const order: KeyLabel[] = [];
+  for (const provider of PROVIDER_PRIORITY) {
+    const indices = poolKeys
+      .filter((k) => k.provider === provider)
+      .map((k) => k.index)
+      .sort((a, b) => a - b);
+    for (const idx of indices) {
+      const label: KeyLabel = `${provider}:${idx}`;
+      if (!isKeyCooling(label)) order.push(label);
+    }
+  }
+  return order;
+}
+
+/** Retry-After in seconds — header first, then the "Please retry in Ns" body
+ * (existing fallback). Null when neither is present. */
+function retryAfterSeconds(err: unknown): number | null {
+  const cast = err as {
+    headers?: Headers | Record<string, string | undefined>;
+    message?: string;
+  };
+  const headers = cast?.headers;
+  if (headers && typeof (headers as Headers).get === "function") {
+    try {
+      const value = (headers as Headers).get("retry-after");
+      if (value) {
+        const n = Number(value.trim());
+        if (Number.isFinite(n) && n >= 0) return Math.round(n);
+      }
+    } catch {
+      // fall through to the body regex
+    }
+  } else if (headers) {
+    const rec = headers as Record<string, string | undefined>;
+    const value = rec["retry-after"] ?? rec["Retry-After"];
+    if (value !== undefined) {
+      const n = Number(value.trim());
+      if (Number.isFinite(n) && n >= 0) return Math.round(n);
+    }
+  }
+  const text = cast?.message ?? String(err);
+  const m = /Please retry in (\d+(?:\.\d+)?)s/i.exec(text);
+  if (m) return Math.round(parseFloat(m[1]));
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Model fail-over + key rotation
 // ---------------------------------------------------------------------------
 
@@ -407,6 +546,14 @@ async function tryModels(
       for (const keyIdx of keyIndices) {
         if (remaining() <= 0) break outer;
         const label: KeyLabel = `${provider}:${keyIdx}`;
+        // M4 per-key circuit — skip keys on per-key cooldown (401/403 kills,
+        // provider-unproductive 429s, or 5xx/timeout failure streaks) before
+        // they are even reached; all keys cooling → the provider yields
+        // nothing and the caller falls through to the next provider.
+        if (isKeyCooling(label)) {
+          attempts.push({ model, status: 0, msg: `${label}: key cooling` });
+          continue;
+        }
         const client = pool.get(label);
         if (!client) continue;
 
@@ -421,13 +568,16 @@ async function tryModels(
           const res = (await call(params, model, client)) as OpenAI.Chat.Completions.ChatCompletion;
           const content = res.choices?.[0]?.message?.content;
           if (content && String(content).trim() !== "") {
+            noteKeySuccess(label);
             return { result: res, keyUsed: label, errored: false, attempts };
           }
           // A 200 with empty content is a FAILED model: reasoning-only models
           // (e.g. some `:free` flash variants) can spend the whole token budget
           // on reasoning and return no customer-facing text. The engine would
           // otherwise reply with the "خلل بسيط" apology every time. Record it
-          // and fall through to the next model/key in the chain.
+          // and fall through to the next model/key in the chain. The KEY did
+          // respond, so reset its transient-failure streak.
+          noteKeySuccess(label);
           attempts.push({
             model,
             status: 0,
@@ -452,24 +602,54 @@ async function tryModels(
           attempts.push({
             model,
             status,
-            msg: `${label}: ${text.slice(0, 120)}`,
+            msg: `${label}: ${redactSecrets(text).slice(0, 120)}`,
           });
 
           if (/budget exhausted/i.test(text)) break outer;
-          // Timeouts/absent models are normal per-model failures — keep trying
-          // remaining models/keys while the budget allows.
-          if (timedOut || absent) continue;
+          // Timeouts count toward the KEY's transient-failure streak (auto-cool
+          // after AI_KEY_FAIL_THRESHOLD); absent models are per-model failures —
+          // the key is healthy, keep trying remaining models/keys.
+          if (timedOut) {
+            noteKeyFailure(label);
+            continue;
+          }
+          if (absent) continue;
+
+          // Lost/invalid key — cool it down and rotate to the next healthy key
+          // of the same provider (all keys of the provider cooling → the phase
+          // yields nothing and the caller falls through to the next provider
+          // in priority). Gemini reports bad keys as 400 "API key not valid",
+          // so that is caught too. Only the `provider:index` label is logged —
+          // never the key itself.
+          const badKey =
+            status === 401 ||
+            status === 403 ||
+            (status === 400 &&
+              /api.?key|API_KEY_INVALID|key not valid|invalid key/i.test(text));
+          if (badKey) {
+            coolDownKey(label, AI_KEY_COOLDOWN_MS, `HTTP ${status} auth`);
+            continue;
+          }
 
           if (quota) {
-            // Back-off the per-model cooldown (covers all keys for this model;
-            // one key hitting 429 means the shared free-tier bucket is empty).
+            // 429: parse Retry-After (seconds; fallback 10s). A wait >=45s
+            // means the provider is unproductive right now → cool THIS key for
+            // min(retryAfter, 120s) and rotate to the next healthy key. A
+            // shorter wait → back off ONCE with that exact delay, retry the
+            // same key/model, then rotate.
+            const retryAfterS = retryAfterSeconds(err) ?? 10;
+            if (retryAfterS * 1000 >= KEY_SHORT_RETRY_MAX_MS) {
+              coolDownKey(
+                label,
+                Math.min(retryAfterS * 1000, KEY_LONG_RETRY_CAP_MS),
+                `429 retry-after ${retryAfterS}s`
+              );
+              continue;
+            }
             // Keep the wait SHORT when the budget is running out: during a
             // quota-exhausted window the customer should get the graceful
             // reply in seconds, not after a long silent wait.
-            const retryMs = Math.min(
-              retryDelayMs(err, 8_000, 20_000),
-              remaining()
-            );
+            const retryMs = Math.min(retryAfterS * 1000, remaining());
             if (retryMs > 0 && remaining() > 4_000) {
               cooldownUntil.set(model, Date.now() + retryMs + 1_000);
               await delay(retryMs);
@@ -478,6 +658,7 @@ async function tryModels(
                 const res2 = (await call(params, model, client)) as OpenAI.Chat.Completions.ChatCompletion;
                 const content2 = res2.choices?.[0]?.message?.content;
                 if (content2 && String(content2).trim() !== "") {
+                  noteKeySuccess(label);
                   return {
                     result: res2,
                     keyUsed: label,
@@ -486,6 +667,7 @@ async function tryModels(
                   };
                 }
                 // Empty content after the quota retry — same handling as above.
+                noteKeySuccess(label);
                 attempts.push({
                   model,
                   status: 0,
@@ -498,22 +680,25 @@ async function tryModels(
                   status: Number(
                     (err2 as { status?: unknown })?.status ?? NaN
                   ),
-                  msg: `${label}: ${(err2 instanceof Error ? err2.message : String(err2)).slice(0, 120)}`,
+                  msg: `${label}: ${redactSecrets(err2 instanceof Error ? err2.message : String(err2)).slice(0, 120)}`,
                 });
               }
             } else {
               cooldownUntil.set(model, Date.now() + 2_000);
             }
-            // Cooldown exhausted — move to the next key/model.
+            // Short-wait 429 exhausted this key for this attempt — rotate.
             break;
           } else if (isTransientError(err)) {
-            // 5xx / network hiccup — a server-side blip on THIS model endpoint,
-            // not an auth failure. Keep trying the remaining models/keys (this
-            // is what makes multi-model failover actually work under a free
-            // model overload instead of aborting the whole chain).
+            // 5xx / network blip — streak-count it on the KEY; after
+            // AI_KEY_FAIL_THRESHOLD consecutive ones the key auto-cools for 5
+            // minutes. Keep trying the remaining models/keys (this is what
+            // makes multi-model failover actually work under a free model
+            // overload instead of aborting the whole chain).
+            noteKeyFailure(label);
             continue;
           }
-          // Hard failure (auth 401/403, etc.) — fail this provider fast.
+          // Hard failure (auth is handled above; anything left here is an
+          // unexpected non-HTTP-classified error) — fail this provider fast.
           return { result: null, keyUsed: null, errored: true, attempts };
         }
       }
@@ -536,6 +721,10 @@ async function tryModels(
  *  4. OpenAI key(s) × AGENT_MODEL
  *
  * Within each provider, each model is retried once with back-off on 429.
+ * Keys on per-key cooldown are skipped first (invalid 401/403 keys,
+ * provider-unproductive 429s with Retry-After >= 45s, and 5xx/timeout
+ * failure streaks — see the per-key section above); when every key of a
+ * provider is cooling the provider is skipped entirely.
  * After exhausting a provider, falls through to the next one in priority.
  * The whole chain is bounded by `budgetMs` (time spent retrying/waiting) and
  * each individual API call by `timeoutMs` — a slow quota wait must never eat
@@ -662,8 +851,61 @@ export async function completeWithFallback(
     `[AI-FALLBACK] ${e.message}\n` +
       attemptLogs
         .slice(-12)
-        .map((a, i) => `  ${i}) ${a.model || "?"} [${a.status}] ${a.msg}`)
+        .map((a, i) => `  ${i}) ${a.model || "?"} [${a.status}] ${redactSecrets(a.msg)}`)
         .join("\n")
   );
   throw e;
+}
+
+// ---------------------------------------------------------------------------
+// Health probe (additive export for M9)
+// ---------------------------------------------------------------------------
+
+export interface AIHealthProbe {
+  configured: boolean;
+  provider: string | null;
+  keyLabel: string | null;
+  ok: boolean;
+  error?: string;
+  latencyMs?: number;
+}
+
+/**
+ * Stateless health probe for M9: sends the smallest possible completion (1
+ * token, temperature 0) through the current model path via completeWithFallback.
+ * NEVER throws — every failure is folded into the result — and touches no
+ * conversation state, so /api/health and cron checks can call it safely.
+ */
+export async function probeAIHealth(): Promise<AIHealthProbe> {
+  if (!isAIConfigured()) {
+    return { configured: false, provider: null, keyLabel: null, ok: false };
+  }
+  const started = Date.now();
+  try {
+    const res = await completeWithFallback(
+      {
+        model: getAgentModel(),
+        messages: [{ role: "user", content: "ping" }],
+        max_tokens: 1,
+        temperature: 0,
+      },
+      { budgetMs: 15_000, timeoutMs: 15_000 }
+    );
+    return {
+      configured: true,
+      provider: getProvider(),
+      keyLabel: (res.keyLabel as KeyLabel | undefined) ?? null,
+      ok: true,
+      latencyMs: Date.now() - started,
+    };
+  } catch (err) {
+    return {
+      configured: true,
+      provider: getProvider(),
+      keyLabel: null,
+      ok: false,
+      error: redactSecrets(err instanceof Error ? err.message : String(err)),
+      latencyMs: Date.now() - started,
+    };
+  }
 }

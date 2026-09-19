@@ -9,18 +9,15 @@ import {
   sendInstagramText,
   verifyHubSignature,
 } from "@/lib/instagram/client";
+import { isDuplicateIngest, dedupKeyForInstagram } from "@/lib/ingest/dedup";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
 
 // ---------------------------------------------------------------------------
-// Deduplication — in-memory, per message mid
-// Instagram (Meta) can re-deliver the same webhook within seconds. This
-// prevents double-processing. Works reliably when Vercel runs a single
-// warm instance. During cold starts or heavy concurrency, two lambda
-// instances *could* both see the same mid — the conversation lock inside
-// engine.ts is the safety net that serializes them.
-// For bullet-proof multi-instance dedup, a shared DB table would be needed.
+// Fast in-memory pre-filter over the DURABLE dedup guard (repli.ingest_dedup).
+// The map below is only a cheap first check on warm instances to avoid a DB
+// round-trip per event; repli.ingest_dedup is the multi-instance authority.
 // ---------------------------------------------------------------------------
 const IG_DEDUP_TTL_MS = 15 * 60_000;
 const seenIgMids = new Map<string, number>();
@@ -33,7 +30,7 @@ function isIgDuplicate(mid: string): boolean {
   return false;
 }
 
-// Periodic cleanup
+// Periodic cleanup of the in-memory map.
 setInterval(() => {
   const cutoff = Date.now() - IG_DEDUP_TTL_MS;
   for (const [id, ts] of seenIgMids) {
@@ -94,6 +91,8 @@ export async function POST(req: Request) {
     }
 
     const entries = payload.entry ?? [];
+    let duplicateCount = 0;
+
     for (const entry of entries) {
       const events = entry.messaging ?? [];
       if (events.length === 0) continue;
@@ -106,68 +105,104 @@ export async function POST(req: Request) {
           .where(eq(restaurants.instagramIgId, igId))
       );
 
+      // One bad event (engine throw, bad sender, dedup error) must never kill
+      // the rest of the batch — each event is processed in isolation.
       for (const event of events) {
-        const text = event.message?.text?.trim();
-        if (!text) continue;
-
-        const senderId = event.sender?.id;
-        if (!senderId) continue;
-
-        if (!restaurant) {
-          console.warn("instagram webhook: no restaurant for igId", igId);
-          continue;
-        }
-
-        // Dedup: skip if this Instagram mid was already processed recently.
-        // Prevents double AI calls and double replies from webhook retries.
-        const mid = event.message?.mid;
-        if (mid && isIgDuplicate(mid)) {
-          console.info(`instagram dedup skip mid=${mid} restaurant=${restaurant.id}`);
-          continue;
-        }
-
-        let replyText = "";
-        let result: Awaited<ReturnType<typeof handleIncomingMessage>> | null = null;
         try {
-          result = await handleIncomingMessage({
+          const text = event.message?.text?.trim();
+          if (!text) continue;
+
+          const senderId = event.sender?.id;
+          if (!senderId) continue;
+
+          if (!restaurant) {
+            console.warn("instagram webhook: no restaurant for igId", igId);
+            continue;
+          }
+
+          const mid = event.message?.mid;
+          const key = dedupKeyForInstagram({
+            messageId: mid,
             restaurantId: restaurant.id,
-            channel: "instagram",
             remoteJid: senderId,
-            contentType: "text",
             text,
-            messageId: event.message?.mid ?? null,
           });
-          replyText = result?.replyText ?? "";
+
+          // In-memory fast pre-filter first (cheap, warm instance only).
+          if (mid && isIgDuplicate(mid)) {
+            duplicateCount += 1;
+            continue;
+          }
+
+          // Durable multi-instance guard. DB-down fails OPEN: the message is
+          // processed inline anyway so the customer is never silenced — the
+          // engine's conversation lock still serializes any race.
+          let alreadySeen = false;
+          try {
+            alreadySeen = await isDuplicateIngest(key);
+          } catch (err) {
+            console.error(
+              "instagram webhook: durable dedup failed, processing anyway",
+              err
+            );
+          }
+          if (alreadySeen) {
+            duplicateCount += 1;
+            console.info(
+              `instagram dedup skip key=${key} restaurant=${restaurant.id}`
+            );
+            continue;
+          }
+
+          let replyText = "";
+          let result: Awaited<ReturnType<typeof handleIncomingMessage>> | null = null;
+          try {
+            result = await handleIncomingMessage({
+              restaurantId: restaurant.id,
+              channel: "instagram",
+              remoteJid: senderId,
+              contentType: "text",
+              text,
+              messageId: mid ?? null,
+            });
+            replyText = result?.replyText ?? "";
+          } catch (err) {
+            console.error("instagram webhook: engine error", err);
+          }
+
+          if (replyText && restaurant.instagramToken) {
+            const sent = await sendInstagramText({
+              igId: restaurant.instagramIgId ?? igId,
+              accessToken: restaurant.instagramToken,
+              recipientId: senderId,
+              text: replyText,
+            });
+            if (!sent.ok) {
+              console.error("instagram webhook: send failed", sent.error);
+            }
+          }
+
+          for (const img of (result?.menuImages ?? []).slice(0, 6)) {
+            if (!restaurant.instagramToken) break;
+            const sentImg = await sendInstagramImage({
+              igId: restaurant.instagramIgId ?? igId,
+              accessToken: restaurant.instagramToken,
+              recipientId: senderId,
+              imageUrl: img.url,
+            });
+            if (!sentImg.ok) {
+              console.error("instagram webhook: image send failed", sentImg.error);
+            }
+          }
         } catch (err) {
-          console.error("instagram webhook: engine error", err);
-        }
-
-        if (replyText && restaurant.instagramToken) {
-          const sent = await sendInstagramText({
-            igId: restaurant.instagramIgId ?? igId,
-            accessToken: restaurant.instagramToken,
-            recipientId: senderId,
-            text: replyText,
-          });
-          if (!sent.ok) {
-            console.error("instagram webhook: send failed", sent.error);
-          }
-        }
-
-        for (const img of (result?.menuImages ?? []).slice(0, 6)) {
-          if (!restaurant.instagramToken) break;
-          const sentImg = await sendInstagramImage({
-            igId: restaurant.instagramIgId ?? igId,
-            accessToken: restaurant.instagramToken,
-            recipientId: senderId,
-            imageUrl: img.url,
-          });
-          if (!sentImg.ok) {
-            console.error("instagram webhook: image send failed", sentImg.error);
-          }
+          console.error("instagram webhook: event processing failed", err);
         }
       }
     }
+
+    return NextResponse.json(
+      duplicateCount > 0 ? { status: "ok", duplicate: true } : { status: "ok" }
+    );
   }
 
   return NextResponse.json({ status: "ok" });

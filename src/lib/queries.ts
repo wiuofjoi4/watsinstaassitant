@@ -1,7 +1,8 @@
-import { desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { unstable_cache } from "next/cache";
 import { db } from "@/lib/db";
 import {
+  conversations,
   errorLogs,
   messages,
   orders,
@@ -282,19 +283,102 @@ customerName: (r.customerName as string | null) ?? null,
   15
 );
 
-export async function getConversationThread(conversationId: string) {
+/** Narrowed column set for the conversation thread — matches exactly what the
+ * thread page renders (id + direction + content + any media/transcription
+ * fields). Avoids `select *` over the wide `messages` rows on the heaviest
+ * admin page. */
+const threadColumns = {
+  id: messages.id,
+  conversationId: messages.conversationId,
+  direction: messages.direction,
+  contentType: messages.contentType,
+  text: messages.text,
+  mediaUrl: messages.mediaUrl,
+  transcription: messages.transcription,
+  status: messages.status,
+  error: messages.error,
+  createdAt: messages.createdAt,
+};
+
+/** Element row returned by the conversation-thread queries. */
+export interface ConversationThreadRow {
+  id: string;
+  conversationId: string;
+  direction: string;
+  contentType: string;
+  text: string | null;
+  mediaUrl: string | null;
+  transcription: string | null;
+  status: string;
+  error: string | null;
+  createdAt: Date;
+}
+
+/** Hard cap so a page of an unbounded history can never fetch more than this. */
+const THREAD_PAGE_MAX = 500;
+
+export async function getConversationThread(
+  conversationId: string
+): Promise<ConversationThreadRow[]> {
   return db
-    .select()
+    .select(threadColumns)
     .from(messages)
     .where(eq(messages.conversationId, conversationId))
     .orderBy(desc(messages.createdAt))
     .limit(200);
 }
 
+/**
+ * Paged conversational-thread helper (new export — additive, existing call
+ * sites unchanged). Returns rows newest-first, the same orientation and
+ * element shape as `getConversationThread`, but scoped to a conversation that
+ * actually belongs to the given restaurant (join on `conversations`), with an
+ * explicit limit/offset cap so deep paging of a long history stays bounded.
+ */
+export async function getConversationThreadPage({
+  restaurantId,
+  conversationId,
+  offset,
+  limit,
+}: {
+  restaurantId: string;
+  conversationId: string;
+  offset: number;
+  limit: number;
+}): Promise<ConversationThreadRow[]> {
+  const safeOffset = Math.max(0, Math.floor(Number(offset) || 0));
+  const safeLimit = Math.min(
+    Math.max(1, Math.floor(Number(limit) || 50)),
+    THREAD_PAGE_MAX
+  );
+  return db
+    .select(threadColumns)
+    .from(messages)
+    .innerJoin(conversations, eq(messages.conversationId, conversations.id))
+    .where(
+      and(
+        eq(messages.conversationId, conversationId),
+        eq(conversations.restaurantId, restaurantId)
+      )
+    )
+    .orderBy(desc(messages.createdAt))
+    .limit(safeLimit)
+    .offset(safeOffset);
+}
+
 export const getRestaurantOrders = cached(
   async (restaurantId: string) =>
     db
-      .select()
+      .select({
+        id: orders.id,
+        customerName: orders.customerName,
+        itemsJson: orders.itemsJson,
+        total: orders.total,
+        phone: orders.phone,
+        address: orders.address,
+        status: orders.status,
+        createdAt: orders.createdAt,
+      })
       .from(orders)
       .where(eq(orders.restaurantId, restaurantId))
       .orderBy(desc(orders.createdAt)),
@@ -309,7 +393,15 @@ export const getRestaurantUsage = cached(
     // usage tab load).
     const [logs, total] = await Promise.all([
       db
-        .select()
+        .select({
+          id: usageLogs.id,
+          createdAt: usageLogs.createdAt,
+          model: usageLogs.model,
+          inputTokens: usageLogs.inputTokens,
+          outputTokens: usageLogs.outputTokens,
+          audioSeconds: usageLogs.audioSeconds,
+          costUsd: usageLogs.costUsd,
+        })
         .from(usageLogs)
         .where(eq(usageLogs.restaurantId, restaurantId))
         .orderBy(desc(usageLogs.createdAt))
@@ -333,7 +425,14 @@ export const getRestaurantUsage = cached(
 export const getRestaurantErrors = cached(
   async (restaurantId: string) =>
     db
-      .select()
+      .select({
+        id: errorLogs.id,
+        source: errorLogs.source,
+        message: errorLogs.message,
+        stack: errorLogs.stack,
+        resolved: errorLogs.resolved,
+        createdAt: errorLogs.createdAt,
+      })
       .from(errorLogs)
       .where(eq(errorLogs.restaurantId, restaurantId))
       .orderBy(desc(errorLogs.createdAt))
@@ -345,7 +444,12 @@ export const getRestaurantErrors = cached(
 export const getRecentErrors = cached(
   async (limit: number = 30) =>
     db
-      .select()
+      .select({
+        id: errorLogs.id,
+        source: errorLogs.source,
+        message: errorLogs.message,
+        createdAt: errorLogs.createdAt,
+      })
       .from(errorLogs)
       .orderBy(desc(errorLogs.createdAt))
       .limit(limit),
