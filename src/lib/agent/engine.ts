@@ -168,14 +168,15 @@ function splitReplyParts(text: string): string[] {
   return parts.length >= 2 ? parts : [];
 }
 
-// Rotating openers for the deterministic greeting so every customer doesn't get
-// the byte-identical phrase (style guide §2). All variants keep the restaurant
-// name + the scripted menu hand-off; a stable per-conversation seed picks one.
-function pickGreeting(restaurantName: string, seed: string): string {
+// Rotating openers for the deterministic greeting — all keep the dictionary's
+// exact rule-1 wording ("وعليكم السلام تفضل عيني هذا المنيو شنو تحب تطلب؟").
+// The rotation only alternates between near-identical phrasings so every
+// customer still gets the scripted hand-off.
+function pickGreeting(seed: string): string {
   const variants = [
-    `وعليكم السلام، أهلاً بيك في ${restaurantName}، تفضل هذا المنيو`,
-    `أهلاً بيك يا غالي في ${restaurantName}، هسه المنيو قدامك`,
-    `وعليكم السلام، أهلين بيك في ${restaurantName}، تفضل من المنيو شنو تحب؟`,
+    `وعليكم السلام تفضل عيني هذا المنيو شنو تحب تطلب؟`,
+    `وعليكم السلام أهلين بيك، تفضل هذا المنيو شنو تحب تطلب؟`,
+    `وعليكم السلام تفضل عيني، هذا المنيو شنو تحب تطلب؟`,
   ];
   let h = 0;
   for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
@@ -739,9 +740,25 @@ const MENU_QUESTION =
   /عندك|عندكم|موجود|متوفر|توفر|يتوفر|الكو|شكد|بشكد|كم سعر|سعره|سعر|أسعار|اسعار|بالسعر|بأي سعر|المنيو|المينيو|قائمه|قائمة|الأصناف|الصنف|اكل|أكل|شنو اكلكم|شو اكلكم|شنو الأكل|شو الأكل|what.*(price|cost)|price|menu|how much|have you got|do you have/i;
 
 // ── Standard script intents (deterministic, guarantee the Iraqi-dialect turn
-// templates below, independent of how the model behaves that day). ──────────
+// ── templates below, independent of how the model behaves that day). ──────────
 const SCRIPT_GREETING =
   /^(?:السلام عليكم|سلام عليكم|السلام عليكي|سلام|هلو|هلا|ہلا|ابل|آبل|صباح الخير|مساء الخير|مسا الخير|مرحبا|أهلاً|اهلا|حياك)/i;
+
+// Dictionary rule 2: customer opens with something that is NOT "السلام عليكم"
+// but still confirms which restaurant they reached — "العفو انت مطعم (x)؟",
+// "هذا مطعم (x)؟"، "اهلا انتوا مطعم (x)؟". Detect the pattern loosely: any
+// "مطعم/انت/انتو" + question → answer with the business name + menu hand-off.
+export const SCRIPT_RESTAURANT_CONFIRM =
+  /(?:العفو|عذرا|عذراً|عفوا|عفواً|هلا|اهلا|أهلا|اي|آي|هذا|هذه|هم|نفس)\s*(?:انتوا|انتو|انتم|انته|انتي|هوه|انت|هو)?\s*(?:مطعم|المطعم|محل|المحل)/i;
+
+// Dictionary rule 3: customer asks about an ITEM's availability — "عدكم X؟",
+// "عندكم X؟"، "أكو X؟"، "موجود عندكم X؟". Must NOT fire on a price ask (بيش/
+// شكد — price lookups are SCRIPT_PRICE_ASK's job) nor on a plain menu request.
+// A lookahead requires a real item token after the verb so a bare "موجود؟"
+// never matches, while the match itself stays the verb only (so checkMenuAvailability
+// can strip just the verb and keep the item name).
+export const SCRIPT_AVAILABILITY_ASK =
+  /(عدكم|عندكم|عدكمه|عندكمه|عدنه|عندنه|أكو|اكو|هواكو|عندك|عدك|موجود عندكم)(?=\s+\S+)/i;
 
 // Custant price question: "بيش الكباب"، "شكد الشاورما"، "بكم"، "كم سعر".
 const SCRIPT_PRICE_ASK =
@@ -830,7 +847,7 @@ function formatIraqiPrice(price: number): string {
   return `${thousands} و${remainder}`; // rare/non-round — say it plainly
 }
 
-function findMenuPrice(
+export function findMenuPrice(
   text: string,
   menu: string
 ): { item: string; price: number; priceText: string } | null {
@@ -841,6 +858,7 @@ function findMenuPrice(
       .replace(/ة/g, "ه")
       .replace(/[ىي]/g, "ي")
       .replace(/ال/g, " ")
+      .replace(/[؟?،,.!؛;:…\s]/g, " ") // also strip Arabic punctuation
       .replace(/[^\u0600-\u06FFa-zA-Z0-9\s]/g, " ")
       .toLowerCase();
   const tokens = (s: string) =>
@@ -880,6 +898,67 @@ function findMenuPrice(
   if (ties.length > 0 || best.score < 1) return null;
 const priceText = String(best.price);
   return { item: best.name.trim(), price: best.price, priceText };
+}
+
+// Dictionary rule 3: "عدكم X؟ / عندكم X؟ / أكو X؟" — page CONFIRMS availability
+// from the dashboard menu (NOT the LLM): "اي نعم موجود ب(السعر)" if the asked
+// item matches a menu line, else "لا نعتذر عيني ما عدنا..". Reuses the same
+// conservative token-matching as findMenuPrice so a miss never claims an item
+// that isn't really there. Returns { available, item, price?, priceText? }.
+export function checkMenuAvailability(
+  text: string,
+  menu: string
+): { available: boolean; item?: string; price?: number; priceText?: string } {
+  const norm = (s: string) =>
+    s
+      .replace(/[\u064B-\u0652\u0670]/g, "") // tashkeel
+      .replace(/[أإآ]/g, "ا")
+      .replace(/ة/g, "ه")
+      .replace(/[ىي]/g, "ي")
+      .replace(/ال/g, " ")
+      .replace(/[؟?،,.!؛;:…\s]/g, " ") // also strip Arabic punctuation
+      .replace(/[^\u0600-\u06FFa-zA-Z0-9\s]/g, " ")
+      .toLowerCase();
+  const tokens = (s: string) =>
+    norm(s).split(/\s+/).filter((w) => w.length >= 3);
+
+  // The item phrase is whatever is left after the availability verb is gone.
+  const phrase = tokens(text.replace(SCRIPT_AVAILABILITY_ASK, " "));
+  if (phrase.length === 0) return { available: false };
+
+  const lines = menu.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) return { available: false };
+
+  let best: { line: string; score: number; price?: number; name: string } | null = null;
+  for (const line of lines) {
+    const priceMatch = line.match(/(\d[\d,]*(?:\.\d+)?)/);
+    const price =
+      priceMatch && priceMatch.index !== undefined
+        ? Number(priceMatch[1].replace(/[,\s]/g, ""))
+        : undefined;
+    const lineTokens = tokens(line);
+    if (lineTokens.length === 0) continue;
+    const score = phrase.filter((w) => lineTokens.includes(w)).length;
+    if (score === 0) continue;
+    if (!best || score > best.score)
+      best = {
+        line,
+        score,
+        price,
+        name: line.slice(0, priceMatch?.index ?? line.length).trim().replace(/[—ـ\-:].*$/, "").trim(),
+      };
+  }
+  if (!best) return { available: false };
+  if (best.score < 1) return { available: false };
+  const priceText = best.price
+    ? formatIraqiPrice(best.price).trim()
+    : undefined;
+  return {
+    available: true,
+    item: best.name.trim(),
+    price: best.price,
+    priceText,
+  };
 }
 
 export interface RunResult {
@@ -1172,6 +1251,42 @@ async function runIncomingMessage(
     if (!cannedReply && SCRIPT_NAME_ASK.test(textNorm)) {
       cannedReply = `أنا ${AGENT_NAME} من ${profile.config.businessName || profile.restaurant.name}، شكو تحتاج؟`;
     }
+    // Dictionary rule 2: NON-salam opener confirming the restaurant
+    // ("العفو انت مطعم X؟"). Answer yes + menu hand-off + menu picture.
+    if (
+      !cannedReply &&
+      SCRIPT_RESTAURANT_CONFIRM.test(textNorm) &&
+      !ORDER_INTENT.test(textNorm) &&
+      !SCRIPT_PRICE_ASK.test(textNorm) &&
+      !SCRIPT_MENU_REQUEST.test(textNorm)
+    ) {
+      const biz = profile.config.businessName || profile.restaurant.name;
+      cannedReply = `اي نعم، أهلاً بيك في ${biz}، شنو تحب تطلب؟`;
+      // The dictionary sends the menu picture with this reply too.
+      sendMenuImages = menuImagesPresent && menuToggle;
+    }
+    // Dictionary rule 3: "عدكم X؟ / عندكم X؟ / أكو X؟" — availability from the
+    // dashboard menu, NOT the model. Present → "اي نعم موجود ب(السعر)" (with
+    // price when the menu line has one); absent → "لا نعتذر عيني ما عدنا..".
+    if (
+      !cannedReply &&
+      SCRIPT_AVAILABILITY_ASK.test(textNorm) &&
+      !SCRIPT_PRICE_ASK.test(textNorm) &&
+      !ORDER_INTENT.test(textNorm) &&
+      !SCRIPT_MENU_REQUEST.test(textNorm) &&
+      !ORDER_CONFIRM.test(textNorm)
+    ) {
+      const av = checkMenuAvailability(textNorm, menuText);
+      if (av.available) {
+        cannedReply = av.priceText
+          ? `اي نعم عيني، ${av.item} موجود بـ ${av.priceText} دينار عراقي`
+          : `اي نعم عيني، ${av.item} موجود عندنا`;
+      } else if (menuText.trim() !== "") {
+        cannedReply = "لا نعتذر عيني ما عدنا..";
+      }
+      // The dictionary sends the menu picture with availability replies too.
+      sendMenuImages = menuImagesPresent && menuToggle;
+    }
     if (
       !cannedReply &&
       greeting &&
@@ -1182,11 +1297,11 @@ async function runIncomingMessage(
       !SCRIPT_MENU_REQUEST.test(textNorm.replace(SCRIPT_GREETING, "")) &&
       !ORDER_CONFIRM.test(textNorm.replace(SCRIPT_GREETING, ""))
     ) {
-      cannedReply = pickGreeting(
-        profile.config.businessName || profile.restaurant.name,
-        conversation.id
-      );
-      sendMenuImages = menuImagesPresent && sendMenuImages;
+      cannedReply = pickGreeting(conversation.id);
+      // The dictionary sends the menu picture with the greeting too, and this
+      // must not depend on AI being configured (canned replies are the fallback
+      // path when no model key exists).
+      sendMenuImages = menuImagesPresent && menuToggle;
     }
     if (
       !cannedReply &&
