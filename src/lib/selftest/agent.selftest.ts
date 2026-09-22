@@ -1,6 +1,7 @@
 import "dotenv/config";
 import {
   checkMenuAvailability,
+  extractOrderCandidates,
   findMenuPrice,
   SCRIPT_AVAILABILITY_ASK,
   SCRIPT_RESTAURANT_CONFIRM,
@@ -90,6 +91,48 @@ async function main(): Promise<void> {
     "price: بيش الشاورما؟ resolves",
     np != null && np.item.includes("شاورما") && np.price === 15000,
     JSON.stringify(np)
+  );
+
+  // --- Dictionary rule 4: order-opener item extraction + blocked hijacks -----
+  const r4 = extractOrderCandidates("السلام عليكم اريد اطلب شاورما دجاج و كباب عربي", MENU, "07701234567");
+  assert(
+    "rule4: named items extracted",
+    r4.items.length === 2 && r4.phone === "07701234567",
+    JSON.stringify(r4)
+  );
+  assert(
+    "rule4: extracted items + prices",
+    r4.items.some((i) => i.name.includes("شاورما") && i.price === 15000) &&
+      r4.items.some((i) => i.name.includes("كباب") && i.price === 25000),
+    JSON.stringify(r4)
+  );
+
+  const r4Single = extractOrderCandidates("ابي اطلب شاورما", "شاورما — 15000", "0770");
+  assert(
+    "rule4: single-token item extracted",
+    r4Single.items.length === 1 && r4Single.items[0].price === 15000,
+    JSON.stringify(r4Single)
+  );
+
+  const r4Bare = extractOrderCandidates("اريد اطلب", MENU, "0770");
+  assert(
+    "rule4: bare opener has NO items (falls to LLM, no premature ask)",
+    r4Bare.items.length === 0,
+    JSON.stringify(r4Bare)
+  );
+
+  const r4Partial = extractOrderCandidates("ابي اطلب شاورما", MENU, "0770");
+  assert(
+    "rule4: partial multi-token name NOT claimed (conservative)",
+    r4Partial.items.length === 0,
+    JSON.stringify(r4Partial)
+  );
+
+  const r4ImgOnly = extractOrderCandidates("اريد اطلب كباب عربي", "", "0770");
+  assert(
+    "rule4: empty/image-only menu → no items, canned قاموس line still applies",
+    r4ImgOnly.items.length === 0,
+    JSON.stringify(r4ImgOnly)
   );
 
   if (fail > 0) {

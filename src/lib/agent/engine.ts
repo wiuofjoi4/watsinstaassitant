@@ -15,7 +15,7 @@ import {
 import { newId } from "@/lib/utils";
 import { first } from "@/lib/db/query";
 import { notifyTelegramOrder } from "@/lib/telegram";
-import { buildSystemPrompt, type BusinessProfile } from "./prompt";
+import { buildSystemPrompt, FOREIGN_DIALECT_MARKERS, type BusinessProfile } from "./prompt";
 import {
   completeWithFallback,
   estimateCostUsd,
@@ -662,6 +662,47 @@ async function buildMessages(
   ];
 }
 
+// قاموس post-flight: a reply that slipped a foreign-dialect marker is re-rolled
+// ONCE with a strict instruction to reply strictly in the Iraqi dialect. Bounded
+// to a single extra call, only triggered on an actual marker (the happy path is
+// untouched). Returns { text, usage, keyLabel }.
+async function rerollDialect(
+  profile: BusinessProfile,
+  messagesList: OpenAI.Chat.Completions.ChatCompletionMessageParam[],
+  badReply: string
+): Promise<{
+  text: string;
+  usage?: { prompt_tokens?: number; completion_tokens?: number };
+  keyLabel?: string;
+}> {
+  const strictNote: OpenAI.Chat.Completions.ChatCompletionMessageParam = {
+    role: "user",
+    content:
+      `Rewrite that last reply STRICTLY in the polite Iraqi dialect (اللهجة العراقية) as the restaurant's staff would.\n` +
+      `Do NOT use any of these foreign words (they sound wrong to Iraqi customers): ${FOREIGN_DIALECT_MARKERS.join("، ")}.\n` +
+      `Keep the meaning identical, short, warm, Iraqi: use "عيني", "شكو", "زين", "أي" for yes, "دعوة"، "المجموع ... دينار", natural Iraqi phrasing. Output ONLY the rewritten reply text, nothing else.`,
+  };
+  const reroll = await completeWithFallback(
+    {
+      model: getAgentModel(),
+      temperature: profile.config.temperature,
+      messages: [
+        ...messagesList,
+        { role: "assistant", content: badReply },
+        strictNote,
+      ],
+      max_tokens: MAX_REPLY_TOKENS,
+    },
+    { budgetMs: REPLY_BUDGET_MS, timeoutMs: REPLY_BUDGET_MS }
+  );
+  const text = reroll.choices[0]?.message?.content?.trim() ?? "";
+  return {
+    text: text || badReply, // never replace a working reply with an empty one
+    usage: reroll.usage,
+    keyLabel: reroll.keyLabel,
+  };
+}
+
 // Cheap heuristic to skip the extractOrder LLM call when the message clearly
 // isn't an order — halves quota burn on casual chat (free-tier Gemini quota
 // exhaustion is the #1 cause of the "try again" apology, so every saved call
@@ -961,6 +1002,76 @@ export function checkMenuAvailability(
   };
 }
 
+/** Extract item candidates for dictionary rule 4's parked ORDER_STATE.
+ * Token-match the customer's order-opener phrase against menu lines (qty 1
+ * each, price from the menu line). Same conservative tokenizer as
+ * findMenuPrice — a generic/no-match message yields no items, so the block is
+ * simply skipped and the قاموس reply still stands on its own. */
+export function extractOrderCandidates(
+  text: string,
+  menu: string,
+  phone: string | null
+): {
+  items: { name: string; qty: number; price: number }[];
+  total: number;
+  phone: string | null;
+} {
+  const norm = (s: string) =>
+    s
+      .replace(/[\u064B-\u0652\u0670]/g, "")
+      .replace(/[أإآ]/g, "ا")
+      .replace(/ة/g, "ه")
+      .replace(/[ىي]/g, "ي")
+      .replace(/ال/g, " ")
+      .replace(/[؟?،,.!؛;:…\s]/g, " ")
+      .replace(/[^\u0600-\u06FFa-zA-Z0-9\s]/g, " ")
+      .toLowerCase();
+  const tokens = (s: string) =>
+    norm(s).split(/\s+/).filter((w) => w.length >= 3);
+  // Strip the order verbs + greeting so "اريد اطلب شاورما" leaves only the
+  // item tokens; a bare filler-only message matches nothing. ORDER_INTENT /
+  // SCRIPT_GREETING / ORDER_CONFIRM lack the /g flag, so strip every
+  // occurrence explicitly.
+  const phrase = tokens(
+    text
+      .replace(new RegExp(SCRIPT_GREETING.source, "gi"), " ")
+      .replace(new RegExp(ORDER_INTENT.source, "gi"), " ")
+      .replace(new RegExp(ORDER_CONFIRM.source, "gi"), " ")
+  );
+  if (phrase.length === 0) return { items: [], total: 0, phone };
+  const lines = menu.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  const items: { name: string; qty: number; price: number }[] = [];
+  for (const line of lines) {
+    const priceMatch = line.match(/(\d[\d,]*(?:\.\d+)?)/);
+    const price =
+      priceMatch && priceMatch.index !== undefined
+        ? Number(priceMatch[1].replace(/[,\s]/g, ""))
+        : undefined;
+    const name = line
+      .slice(0, priceMatch?.index ?? line.length)
+      .trim()
+      .replace(/[—ـ\-:].*$/, "")
+      .trim();
+    const nameTokens = tokens(name);
+    if (nameTokens.length === 0) continue;
+    const score = phrase.filter((w) => nameTokens.includes(w)).length;
+    if (score === 0) continue;
+    // Claim a line when the customer's phrase covers the FULL item name (e.g.
+    // "شاورما دجاج") OR the whole item is a single unambiguous token (e.g.
+    // "كباب"). A partial multi-token match (handled via QuantityTooMany, not
+    // here) stays out — the model refines exact qty/price later anyway.
+    const full = score === nameTokens.length;
+    const single = nameTokens.length === 1 && score === 1;
+    if (!full && !single) continue;
+    items.push({ name, qty: 1, price: price ?? 0 });
+  }
+  return {
+    items: items.slice(0, 8),
+    total: items.reduce((s, i) => s + i.qty * i.price, 0),
+    phone,
+  };
+}
+
 export interface RunResult {
   replyText: string;
   /** Optional split of replyText into 2-3 short sequential messages (style
@@ -1234,6 +1345,7 @@ async function runIncomingMessage(
   // lookup. Anything else falls through to the LLM below (which carries the
   // same script in its system prompt). ─────────────────────────────────────
   let cannedReply: string | null = null;
+  let cannedOrderBlock = "";
   if (input.contentType === "text" && effectiveText.trim() !== "") {
     const textNorm = effectiveText.trim();
     const menuText = profile.config.menu || "";
@@ -1332,9 +1444,48 @@ async function runIncomingMessage(
         cannedReply = `عيني، ${found.item} بـ ${formatIraqiPrice(found.price)} دينار عراقي`;
       }
     }
+    // Dictionary rule 4: a NEW-order opener that NAMES items ("السلام عليكم
+    // اريد اطلب X و Y"). The قاموس's reply is deterministic — "تدلل عيني بس
+    // عادي ترسل موقع التوصيل." — and the WhatsApp sender number is the order
+    // phone. Only fires while NO order material exists yet so mid-order turns
+    // ("اضيف شاورما") keep flowing to the model, and only when the asked items
+    // were actually extracted from the text menu (a bare "اريد اطلب" with no
+    // item names, or an image-only menu, falls to the LLM which asks what they
+    // want — never a premature location ask).
+    if (
+      !cannedReply &&
+      ORDER_INTENT.test(textNorm) &&
+      !context.hasOrderMaterial &&
+      !ORDER_CONFIRM.test(textNorm) &&
+      !SCRIPT_PRICE_ASK.test(textNorm) &&
+      !SCRIPT_MENU_REQUEST.test(textNorm) &&
+      !SCRIPT_AVAILABILITY_ASK.test(textNorm) &&
+      !SCRIPT_STATUS_ASK.test(textNorm) &&
+      !ORDER_CONTINUE.test(textNorm)
+    ) {
+      // Token-match the asked items against the text menu (qty 1 each; the
+      // model refines on later turns) and park them in a pending ORDER_STATE so
+      // the customer's next "support/address/اكمل" turn still has order
+      // material.
+      const candidates = extractOrderCandidates(
+        textNorm,
+        menuText,
+        effectiveContext.phone
+      );
+      if (candidates.items.length > 0) {
+        cannedReply = "تدلل عيني بس عادي ترسل موقع التوصيل.";
+        cannedOrderBlock = `${ORDER_STATE_OPEN}${JSON.stringify(
+          candidates
+        )}${ORDER_STATE_CLOSE}`;
+      }
+    }
   }
   if (cannedReply) {
     replyText = stripEmojis(cannedReply) || cannedReply;
+    // The parked ORDER_STATE block rides inside rawReply (stored log) so the
+    // next turn re-condenses the items without a fresh LLM call; it is already
+    // removed from the customer-facing text downstream by stripOrderBlock.
+    replyText += cannedOrderBlock;
   } else if (!hasAI || effectiveText.trim() === "") {
     replyText =
       "عذراً، أني ما قدرت أعالج رسالتك. ترجع ترسلها مرة ثانية؟";
@@ -1370,10 +1521,32 @@ async function runIncomingMessage(
         replyText = GRACEFUL_FALLBACK;
       }
       const usage = res.usage;
-      const inTok = usage?.prompt_tokens ?? 0;
-      const outTok = usage?.completion_tokens ?? 0;
+      let inTok = usage?.prompt_tokens ?? 0;
+      let outTok = usage?.completion_tokens ?? 0;
       const audioSec = input.contentType === "voice" ? Math.max(1, Math.round((effectiveText.length ?? 0) / 15)) : 0;
       costUsd = estimateCostUsd(inTok, outTok, audioSec);
+
+      // قاموس guard: if the reply slipped a non-Iraqi/foreign-dialect marker
+      // (the owner's #1 complaint — the agent "says things that are not
+      // Iraqi"), re-prompt ONCE with a strict instruction. Bounded, and only
+      // when an actual violation marker appears, so the happy path is untouched.
+      if (
+        FOREIGN_DIALECT_MARKERS.length > 0 &&
+        FOREIGN_DIALECT_MARKERS.some((m) => replyText.includes(m))
+      ) {
+        step("dialectReRoll");
+        const rerolled = await rerollDialect(
+          profile,
+          messagesList,
+          replyText
+        );
+        usedKeyLabel = (rerolled.keyLabel ?? usedKeyLabel) as KeyLabel | undefined;
+        replyText = rerolled.text;
+        const rrUsage = rerolled.usage;
+        inTok += rrUsage?.prompt_tokens ?? 0;
+        outTok += rrUsage?.completion_tokens ?? 0;
+        costUsd += estimateCostUsd(rrUsage?.prompt_tokens ?? 0, rrUsage?.completion_tokens ?? 0, 0);
+      }
 
       // Usage/spend bookkeeping is best-effort: if the DB hiccups here, the
       // produced reply MUST still reach the customer (grep λ errors would

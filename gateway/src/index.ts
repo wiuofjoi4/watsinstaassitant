@@ -261,16 +261,25 @@ async function startSessionInner(restaurantId: string): Promise<void> {
     }
     if (qr) {
       session.qr = qr;
+      // One-shot gate: Baileys re-emits a fresh QR on every pairing polling tick
+      // (typically every ~20-90s while waiting to be scanned), and each event
+      // used to re-POST "qr_ready" — the platform alerted the owner on EVERY
+      // one, flooding the alert bot (~1000 false "disconnected" alerts/day).
+      // Post only on the FIRST QR of each session/pairing episode; the platform
+      // stays in "waiting" until a "connected" flips it back.
+      const firstQrOfSession = !session.qrOnce;
       session.qrOnce = true;
-      if (session.lastJid) {
-        // This is a RE-PAIR, not a first pairing: the WhatsApp session was
-        // previously connected and is being forced to re-authenticate. Loud log
-        // so the owner's Telegram alert (platform status route) has context.
-        logger.warn(
-          `re-pair required for ${restaurantId} (was connected as ${session.lastJid}) — QR presented`
-        );
+      if (firstQrOfSession) {
+        if (session.lastJid) {
+          // This is a RE-PAIR, not a first pairing: the WhatsApp session was
+          // previously connected and is being forced to re-authenticate. Loud
+          // log so the owner's Telegram alert (platform status route) has context.
+          logger.warn(
+            `re-pair required for ${restaurantId} (was connected as ${session.lastJid}) — QR presented`
+          );
+        }
+        void postStatus(restaurantId, "qr_ready");
       }
-      void postStatus(restaurantId, "qr_ready");
     }
     if (connection === "open") {
       // A successfully connected socket means the failure streak is over —

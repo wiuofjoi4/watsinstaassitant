@@ -13,6 +13,17 @@ export function languagesLabel(value: string): string {
     .join(", ");
 }
 
+// Foreign-dialect / MSA markers the model must never write. The engine uses
+// this as a deterministic post-flight guard: if a reply slips a word from a
+// non-Iraqi dialect, it is re-rolled once with a strict Iraqi instruction
+// instead of reaching the customer. Keep in sync with the prompt's rule below.
+export const FOREIGN_DIALECT_MARKERS = [
+  "واش", "كيفاش", "برشا", "هكا", "عندكش", "تقدرش", "باهي", "دير",
+  "طب", "معلش", "إنتو", "عايز", "يستا", "هعمل",
+  "شو", "إشي", "هلق", "بدي", "مشان",
+  "كيف يمكنني مساعدتك", "ما هو طلبكم", "نتمنى لكم",
+];
+
 export interface BuildPromptOptions {
   /** The WhatsApp sender's number (from the message itself), so the assistant
    * never has to ask the customer for it. */

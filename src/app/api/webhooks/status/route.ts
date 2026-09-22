@@ -11,6 +11,15 @@ export const runtime = "nodejs";
 const GATEWAY_PUBLIC_URL =
   process.env.GATEWAY_PUBLIC_URL ?? "https://repli-gateway.onrender.com";
 
+// Re-link alerts for the same restaurant are throttled even if the gateway
+// posts "qr_ready" repeatedly (restart, re-pair polling, redeploy). Once the
+// owner is told to re-scan, telling them again every few minutes adds noise,
+// not value. In-memory is intentional (same trade-off as the healthcheck cron):
+// a warm instance keeps the window, a cold one may re-alert once — a genuine
+// outage is still surfaced, just never spammed.
+const QR_ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes per restaurant
+const lastQrAlertAt = new Map<string, number>();
+
 interface StatusBody {
   restaurantId: string;
   channel: "whatsapp" | "instagram";
@@ -87,12 +96,24 @@ export async function POST(req: Request) {
 
   // Fire-and-forget (never blocks the status write): tell the owner a fresh QR
   // must be scanned to bring the bot back. Guarded inside sendAlert when no
-  // Telegram alert channel is configured.
+  // Telegram alert channel is configured. Throttled per restaurant so a
+  // repeated qr_ready (gateway restart / polling re-pair) does NOT re-alert
+  // the owner every few minutes. A successful "connected" clears the window so
+  // a later genuine crash still alerts promptly.
+  if (body.channel === "whatsapp" && body.event === "connected") {
+    lastQrAlertAt.delete(body.restaurantId);
+  }
   if (
     body.channel === "whatsapp" &&
     body.event === "qr_ready" &&
     wasLinked
   ) {
+    const now = Date.now();
+    const last = lastQrAlertAt.get(body.restaurantId) ?? 0;
+    if (now - last < QR_ALERT_COOLDOWN_MS) {
+      return NextResponse.json({ ok: true, alertSkipped: true });
+    }
+    lastQrAlertAt.set(body.restaurantId, now);
     const qrUrl = `${GATEWAY_PUBLIC_URL}/qr/${encodeURIComponent(body.restaurantId)}/whatsapp`;
     void sendAlert(
       `[واست] اتصال واتساب انقطع ويحتاج إعادة ربط! امسح QR جديداً خلال دقائق حتى يرجع الرد الآلي:\n${qrUrl}`
