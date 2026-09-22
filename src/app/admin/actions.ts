@@ -105,6 +105,7 @@ export async function saveAgentConfig(formData: FormData) {
     menu: String(formData.get("menu") ?? ""),
     policies: String(formData.get("policies") ?? ""),
     customInstructions: String(formData.get("customInstructions") ?? ""),
+    customSystemPrompt: String(formData.get("customSystemPrompt") ?? ""),
     temperature: Number(formData.get("temperature") ?? 0.7),
     askPhone: formData.get("askPhone") === "on",
     askAddress: formData.get("askAddress") === "on",
@@ -123,12 +124,33 @@ export async function saveAgentConfig(formData: FormData) {
     policies: update.policies ?? "",
     customInstructions: update.customInstructions ?? "",
     systemPrompt: existing?.systemPrompt ?? "",
+    customSystemPrompt: update.customSystemPrompt ?? "",
     temperature: update.temperature ?? 0.7,
     askPhone: update.askPhone ?? true,
     askAddress: update.askAddress ?? true,
     updatedAt: new Date(),
   };
   merged.systemPrompt = buildSystemPrompt({ restaurant, config: merged });
+
+  // The prompt box renders `customSystemPrompt || systemPrompt` (user override
+  // wins, else the auto-generated copy). On save:
+  //   - unchanged box  → submitted text equals what was rendered → keep the
+  //     stored custom (or stay empty so the auto prompt keeps regenerating).
+  //   - edited box     → submitted differs from what was rendered → persist
+  //     it as the custom override so the engine uses it verbatim.
+  // This keeps the auto-regenerated `systemPrompt` fresh for display while a
+  // manual override, once written, sticks until edited/cleared.
+  const submittedCustomPrompt = String(formData.get("customSystemPrompt") ?? "").trim();
+  const renderedPrompt = existing
+    ? existing.customSystemPrompt || existing.systemPrompt || ""
+    : "";
+  update.customSystemPrompt =
+    submittedCustomPrompt === ""
+      ? "" // box cleared → revert to the auto-generated prompt
+      : submittedCustomPrompt !== renderedPrompt
+        ? submittedCustomPrompt // edited → persist the manual override
+        : existing?.customSystemPrompt ?? ""; // untouched → keep as stored
+  merged.customSystemPrompt = update.customSystemPrompt;
 
   if (existing) {
     await withQueryTimeout(
@@ -168,7 +190,11 @@ export async function regeneratePrompt(formData: FormData) {
   await withQueryTimeout(
     db
       .update(agentConfigs)
-      .set({ systemPrompt: prompt, updatedAt: new Date() })
+      .set({
+        systemPrompt: prompt,
+        customSystemPrompt: "",
+        updatedAt: new Date(),
+      })
       .where(eq(agentConfigs.restaurantId, restaurantId))
   );
   revalidatePath(`/admin/restaurants/${restaurantId}`);

@@ -29,6 +29,8 @@ CREATE INDEX IF NOT EXISTS "error_logs_resolved_idx" ON "repli"."error_logs" USI
 --> statement-breakpoint
 ALTER TABLE "repli"."usage_logs" ADD COLUMN IF NOT EXISTS "key_label" text DEFAULT '' NOT NULL;
 --> statement-breakpoint
+ALTER TABLE "repli"."agent_configs" ADD COLUMN IF NOT EXISTS "custom_system_prompt" text DEFAULT '' NOT NULL;
+--> statement-breakpoint
 CREATE TABLE IF NOT EXISTS "repli"."telegram_bots" (
   "id" text PRIMARY KEY NOT NULL,
   "restaurant_id" text NOT NULL,

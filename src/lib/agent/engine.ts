@@ -395,6 +395,7 @@ async function getBusiness(restaurantId: string): Promise<BusinessProfile | null
       policies: "",
       customInstructions: "",
       systemPrompt: "",
+      customSystemPrompt: "",
       temperature: 0.7,
       askPhone: true,
       askAddress: true,
@@ -596,14 +597,15 @@ async function buildMessages(
   clearedContext?: CondensedContext | null,
   clearNote?: string
 ): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam[]> {
-  // ONE request per turn: the current message + a compact deterministic
-  // summary of everything before it. Never resend the raw log in every call —
-  // that choked slow/free models (multi-request turns) and quadrupled tokens.
-  // Always rebuild the system prompt here (buildSystemPrompt) instead of the
-  // stored config.systemPrompt: the stored copy was frozen at save time and
-  // still carried stale instructions (ORDER_SUMMARY, ask-for-phone, emojis).
-  // On a NEW-order opener the cleared context replaces the condensed one so the
-  // model never sees the previous order's items/address.
+  // The prompt base is rebuilt every turn (buildSystemPrompt) when no custom
+  // override exists — the auto copy reflects live field edits and never goes
+  // stale. When the dashboard owner wrote a customSystemPrompt override, that
+  // text is used verbatim instead (they took manual control). In BOTH cases
+  // the runtime-only blocks below are appended: order contract, per-turn menu
+  // notes and the condensed conversation context, without which order capture
+  // and cross-turn memory silently break. On a NEW-order opener the cleared
+  // context replaces the condensed one so the model never sees the previous
+  // order's items/address.
   const effectiveContext: CondensedContext =
     clearedContext ??
     (senderPhone
@@ -625,8 +627,11 @@ async function buildMessages(
     ((input.contentType === "image" || input.contentType === "video") &&
       textForGate === "");
 
+  const customPrompt = profile.config.customSystemPrompt?.trim();
   const systemPrompt =
-    buildSystemPrompt(profile, { senderPhone, includeMenu: menuNeeded }) +
+    (customPrompt
+      ? customPrompt
+      : buildSystemPrompt(profile, { senderPhone, includeMenu: menuNeeded })) +
     orderContract(senderPhone) +
     (menuNote ? `\n\n${menuNote}` : "") +
     (clearNote ? `\n\n${clearNote}` : "") +

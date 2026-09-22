@@ -151,6 +151,8 @@ CREATE INDEX "usage_logs_restaurant_idx" ON "repli"."usage_logs" USING btree ("r
 --> statement-breakpoint
 ALTER TABLE "repli"."usage_logs" ADD COLUMN IF NOT EXISTS "key_label" text DEFAULT '' NOT NULL;
 --> statement-breakpoint
+ALTER TABLE "repli"."agent_configs" ADD COLUMN IF NOT EXISTS "custom_system_prompt" text DEFAULT '' NOT NULL;
+--> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "messages_conversation_created_idx" ON "repli"."messages" USING btree ("conversation_id","created_at" DESC);
 --> statement-breakpoint
 CREATE INDEX IF NOT EXISTS "orders_restaurant_status_idx" ON "repli"."orders" USING btree ("restaurant_id","status");

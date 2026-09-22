@@ -8,6 +8,7 @@ import {
   setOrderStatus,
   toggleAgent,
 } from "@/app/admin/actions";
+import { Toggle } from "@/components/ui";
 
 /**
  * Client-side admin actions: optimistic UI + router.refresh() instead of a
@@ -135,6 +136,24 @@ export function OrderStatusSelect({
         </option>
       ))}
     </select>
+  );
+}
+
+export function AskToggle({
+  name,
+  checked,
+  label,
+}: {
+  name: string;
+  checked: boolean;
+  label: string;
+}) {
+  const [on, setOn] = useState(checked ?? false);
+  return (
+    <label className="flex cursor-pointer items-center gap-2.5 text-sm text-soft">
+      <Toggle checked={on} name={name} onChange={() => setOn((v) => !v)} />
+      {label}
+    </label>
   );
 }
 

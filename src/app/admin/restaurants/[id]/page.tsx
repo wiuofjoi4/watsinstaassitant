@@ -3,17 +3,19 @@ import { notFound } from "next/navigation";
 import {
   connectInstagram,
   disconnectInstagram,
+  regeneratePrompt,
   removeTelegramBot,
   saveAgentConfig,
   saveTelegramBot,
 } from "@/app/admin/actions";
 import {
   AgentToggle,
+  AskToggle,
   GenerateLinkButton,
   OrderStatusSelect,
   ResolveErrorButton,
 } from "@/components/admin/detail-actions";
-import { Badge, Card, CardHeader, EmptyState, Field, Input, Select, Textarea, Toggle } from "@/components/ui";
+import { Badge, Card, CardHeader, EmptyState, Field, Input, Select, Textarea } from "@/components/ui";
 import MenuImagesPanel from "@/components/menu-images-panel";
 import {
   getRestaurantConversations,
@@ -431,24 +433,32 @@ function AgentTab({ restaurant }: { restaurant: NonNullable<Awaited<ReturnType<t
         </Field>
 
         <div className="flex flex-wrap gap-6">
-          <label className="flex items-center gap-2.5 text-sm text-soft">
-            <Toggle key={`phone-${a?.askPhone}`} checked={a?.askPhone ?? true} name="askPhone" />
-            Ask for phone number
-          </label>
-          <label className="flex items-center gap-2.5 text-sm text-soft">
-            <Toggle key={`addr-${a?.askAddress}`} checked={a?.askAddress ?? true} name="askAddress" />
-            Ask for delivery address
-          </label>
+          <AskToggle name="askPhone" checked={a?.askPhone ?? true} label="Ask for phone number" />
+          <AskToggle name="askAddress" checked={a?.askAddress ?? true} label="Ask for delivery address" />
         </div>
 
-        <div className="rounded-lg border border-line bg-surface/60 p-4">
-          <p className="mb-2 text-xs font-medium text-muted">Generated system prompt (auto)</p>
-          <pre className="max-h-64 overflow-auto whitespace-pre-wrap font-mono text-xs text-muted/90">
-            {a?.systemPrompt ?? "Save the form once to generate the prompt."}
-          </pre>
-        </div>
+        <Field
+          label="System prompt"
+          hint="Auto-generated from the fields above. Edit it to override — the agent will use your text as-is. Click “Reset to auto” to regenerate from the current fields."
+        >
+          <Textarea
+            name="customSystemPrompt"
+            rows={18}
+            className="font-mono text-xs"
+            defaultValue={a?.customSystemPrompt || a?.systemPrompt || ""}
+          />
+        </Field>
 
         <div className="flex justify-end gap-3">
+          <form action={regeneratePrompt}>
+            <input type="hidden" name="restaurantId" value={restaurant.id} />
+            <button
+              type="submit"
+              className="rounded-lg border border-line px-3.5 py-2 text-sm font-medium text-muted transition-colors hover:text-soft"
+            >
+              ↻ Reset prompt to auto
+            </button>
+          </form>
           <button
             type="button"
             className="rounded-lg border border-line px-3.5 py-2 text-sm font-medium text-muted transition-colors hover:text-soft"

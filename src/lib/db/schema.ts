@@ -70,6 +70,7 @@ export const agentConfigs = repli.table(
     policies: text("policies").notNull().default(""),
     customInstructions: text("custom_instructions").notNull().default(""),
     systemPrompt: text("system_prompt").notNull().default(""),
+    customSystemPrompt: text("custom_system_prompt").notNull().default(""),
     temperature: real("temperature").notNull().default(0.7),
     askPhone: boolean("ask_phone").notNull().default(true),
     askAddress: boolean("ask_address")
